@@ -1,7 +1,17 @@
 """Floating VU meter overlay — shows live audio level bars while recording."""
 
+import os
 import threading
-import time
+from datetime import datetime
+
+STATE_DIR = os.path.expanduser("~/.voice-clip")
+LOG_PATH = os.path.join(STATE_DIR, "voiceclip-debug.log")
+
+
+def _log(msg):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(LOG_PATH, "a") as f:
+        f.write(f"{datetime.now().isoformat()} [overlay] {msg}\n")
 
 import objc
 from AppKit import (
@@ -18,9 +28,8 @@ from AppKit import (
     NSRect,
     NSPoint,
     NSSize,
-    NSGraphicsContext,
 )
-from Foundation import NSTimer, NSRunLoop, NSDefaultRunLoopMode
+from Foundation import NSTimer
 
 # kCGMaximumWindowLevelKey — highest possible, renders above everything
 import Quartz
@@ -52,8 +61,10 @@ class VUMeterView(NSView):
         """Set the current audio level (0.0 - 1.0)."""
         self._target_level = float(level)
 
-    def updateBars(self):
-        """Animate bars toward target level with some variation."""
+    def updateBars_(self, timer):
+        """Animate bars toward target level with some variation.
+        Called by NSTimer — must accept timer argument (v@:@ signature).
+        """
         import random
         for i in range(NUM_BARS):
             # Each bar gets a slightly different target for organic look
@@ -155,17 +166,19 @@ class RecordingOverlay:
             return
 
         def _show_on_main():
+            _log(f"_show_on_main called (thread={threading.current_thread().name})")
             self._ensure_window()
+            self._window.setAlphaValue_(1.0)
             self._window.orderFrontRegardless()
             self._visible = True
+            _log("overlay shown")
             # Start animation timer (30fps)
             self._timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-                1.0 / 30.0, self._view, objc.selector(VUMeterView.updateBars, signature=b"v@:"),
+                1.0 / 30.0, self._view, objc.selector(VUMeterView.updateBars_, signature=b"v@:@"),
                 None, True,
             )
 
         # Must run on main thread
-        from AppKit import NSApp
         if threading.current_thread() is threading.main_thread():
             _show_on_main()
         else:
@@ -174,15 +187,20 @@ class RecordingOverlay:
 
     def hide(self):
         """Hide the overlay window."""
-        if not self._visible:
-            return
+        # NOTE: Do not check self._visible here — show() queues _show_on_main
+        # async, so _visible may still be False when hide() is called from a
+        # fast key release.  Let _hide_on_main run on the main thread where
+        # the state is consistent.
 
         def _hide_on_main():
+            _log("_hide_on_main called")
             if self._timer:
                 self._timer.invalidate()
                 self._timer = None
             if self._window:
+                self._window.setAlphaValue_(0.0)
                 self._window.orderOut_(None)
+                _log("_hide_on_main: orderOut + alpha=0 done")
             self._visible = False
 
         if threading.current_thread() is threading.main_thread():

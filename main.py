@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
 VoiceClip — Hold-to-record speech-to-text for macOS.
-Hold Fn key to record, release to transcribe, result goes to clipboard.
+Hold Right Command key to record, release to transcribe, result auto-pastes.
 
 Uses CGEventTap (passive/listen-only) for hotkey detection.
-Requires Accessibility permission only.
+Requires Accessibility (hotkey) and Microphone permissions.
 """
 
+import atexit
+import fcntl
 import os
 import subprocess
 import threading
 import logging
+import sys
 
 import rumps
 
@@ -19,8 +22,15 @@ from transcriber import Transcriber
 from overlay import RecordingOverlay
 from hotkey import HotkeyListener
 
+STATE_DIR = os.path.expanduser("~/.voice-clip")
+LOG_PATH = os.path.join(STATE_DIR, "voiceclip-debug.log")
+PID_FILE = os.path.join(STATE_DIR, "voiceclip.pid")
+_instance_lock_fd = None
+
+os.makedirs(STATE_DIR, exist_ok=True)
+
 logging.basicConfig(
-    filename=os.path.expanduser("~/.voice-clip/voiceclip-debug.log"),
+    filename=LOG_PATH,
     level=logging.DEBUG,
     format="%(asctime)s %(message)s",
 )
@@ -29,7 +39,7 @@ log = logging.getLogger("voiceclip")
 
 def _log(msg):
     """Write directly to log file (no buffering issues)."""
-    with open(os.path.expanduser("~/.voice-clip/voiceclip-debug.log"), "a") as f:
+    with open(LOG_PATH, "a") as f:
         from datetime import datetime
         f.write(f"{datetime.now().isoformat()} {msg}\n")
 
@@ -63,28 +73,28 @@ class VoiceClipApp(rumps.App):
         # Start hotkey listener (CGEventTap — passive, Accessibility only)
         log.info("Starting VoiceClip — registering CGEventTap hotkey listener")
         self._hotkey = HotkeyListener(
-            on_press=self._on_fn_press,
-            on_release=self._on_fn_release,
+            on_press=self._on_hotkey_press,
+            on_release=self._on_hotkey_release,
         )
         self._hotkey.start()
         log.info("Hotkey listener started")
 
-    def _on_fn_press(self):
-        """Fn key pressed — start recording."""
+    def _on_hotkey_press(self):
+        """Right Command pressed — start recording."""
         if self._key_pressed or self._transcribing:
             return
-        log.info("Fn pressed — start recording")
+        log.info("Hotkey pressed — start recording")
         self._key_pressed = True
         self._set_status("Recording...")
         self.title = "\U0001f534"  # 🔴
         self.overlay.show()
         self.recorder.start()
 
-    def _on_fn_release(self):
-        """Fn key released — stop recording and transcribe."""
+    def _on_hotkey_release(self):
+        """Right Command released — stop recording and transcribe."""
         if not self._key_pressed:
             return
-        log.info("Fn released — stop recording")
+        log.info("Hotkey released — stop recording")
         self._key_pressed = False
         self._transcribing = True
         self._set_status("Transcribing...")
@@ -211,9 +221,39 @@ def _paste_from_clipboard():
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, event_up)
 
 
+def _check_single_instance():
+    """Ensure only one VoiceClip instance is active using an advisory file lock."""
+    global _instance_lock_fd
+    os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)
+    _instance_lock_fd = os.open(PID_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(_instance_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+
+    os.ftruncate(_instance_lock_fd, 0)
+    os.write(_instance_lock_fd, f"{os.getpid()}\n".encode("utf-8"))
+
+    def _release_instance_lock():
+        global _instance_lock_fd
+        if _instance_lock_fd is not None:
+            try:
+                fcntl.flock(_instance_lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(_instance_lock_fd)
+            _instance_lock_fd = None
+
+    atexit.register(_release_instance_lock)
+    return True
+
+
 if __name__ == "__main__":
     try:
         _log("main: starting VoiceClipApp")
+        if not _check_single_instance():
+            _log("main: another VoiceClip instance is already running; exiting")
+            sys.exit(0)
         app = VoiceClipApp()
         _log("main: calling app.run()")
         app.run()

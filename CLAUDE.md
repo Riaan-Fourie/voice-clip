@@ -9,14 +9,15 @@ macOS speech-to-text app. Hold Right Command key to record, release to transcrib
 - **transcriber.py** — mlx-whisper (local Whisper on Apple Silicon via Metal GPU), model: `mlx-community/whisper-base-mlx`
 - **overlay.py** — floating VU meter overlay (NSPanel + custom NSView, renders above fullscreen apps)
 - **hotkey.py** — CGEventTap on main run loop for Right Command key detection (Accessibility permission only)
-- **start.sh** — wrapper that restarts main.py in a loop
-- **setup.sh** — venv, deps, LaunchAgent install
+- **start.sh** — local launcher for `main.py`
+- **install.sh** — canonical installer/uninstaller (`./install.sh`, `./install.sh --uninstall`)
+- **setup.sh** — deprecated wrapper that forwards to `install.sh`
 
 ## Key Behavior
 - Hold Right Command → record with VU meter overlay → release → transcribe → auto-paste into focused window
 - Also copies to clipboard as backup
 - Failed transcriptions saved to `~/.voice-clip/failed/` with retry via menubar
-- Auto-starts on login via LaunchAgent (`~/Library/LaunchAgents/com.riaanfourie.voiceclip.plist`)
+- Optional auto-start via macOS Login Items (`/Applications/VoiceClip.app`)
 - Logs at `~/.voice-clip/voiceclip-debug.log`
 - Always uses MacBook Air built-in mic (better quality than Bluetooth)
 
@@ -24,7 +25,7 @@ macOS speech-to-text app. Hold Right Command key to record, release to transcrib
 rumps, sounddevice, numpy, mlx-whisper, pyobjc-framework-Cocoa, pyobjc-framework-Quartz
 
 ## Permissions
-- **Accessibility** — for CGEventTap hotkey detection (only permission needed)
+- **Accessibility** — for CGEventTap hotkey detection
 - **Microphone** — macOS prompts on first use
 
 ## Key Decisions

@@ -6,8 +6,6 @@ Only requires Accessibility permission.
 import os
 import time
 import Quartz
-from PyObjCTools import AppHelper
-from Foundation import NSTimer
 
 # Right Command key = keyCode 54
 HOTKEY_KEYCODE = 54
@@ -19,10 +17,12 @@ MIN_HOLD_DURATION = 0.15
 # Cooldown: minimum gap between end of one recording and start of next (seconds)
 COOLDOWN_AFTER_RELEASE = 0.5
 
-LOG_PATH = os.path.expanduser("~/.voice-clip/voiceclip-debug.log")
+STATE_DIR = os.path.expanduser("~/.voice-clip")
+LOG_PATH = os.path.join(STATE_DIR, "voiceclip-debug.log")
 
 
 def _log(msg):
+    os.makedirs(STATE_DIR, exist_ok=True)
     with open(LOG_PATH, "a") as f:
         from datetime import datetime
         f.write(f"{datetime.now().isoformat()} [hotkey] {msg}\n")
@@ -45,8 +45,8 @@ class HotkeyListener:
         """Attach CGEventTap to the main thread's run loop.
         Must be called BEFORE the NSApplication run loop starts (i.e. before rumps.App.run()).
         """
-        # Listen for flagsChanged (modifier keys) AND keyDown/keyUp
-        mask = (1 << Quartz.kCGEventFlagsChanged) | (1 << Quartz.kCGEventKeyDown) | (1 << Quartz.kCGEventKeyUp)
+        # Right Command is modifier-only, so flagsChanged is sufficient.
+        mask = 1 << Quartz.kCGEventFlagsChanged
         listener = self
 
         def tap_callback(proxy, event_type, event, refcon):
@@ -62,6 +62,11 @@ class HotkeyListener:
                     _log("CGEventTap was disabled by user input — re-enabling")
                     if listener._tap:
                         Quartz.CGEventTapEnable(listener._tap, True)
+                    return event
+
+                # Right Command is a modifier — only handle flagsChanged events
+                # to avoid duplicate firing from keyDown/keyUp events
+                if event_type != Quartz.kCGEventFlagsChanged:
                     return event
 
                 keycode = Quartz.CGEventGetIntegerValueField(
@@ -123,23 +128,6 @@ class HotkeyListener:
         # Keep references alive
         self._tap = tap
         self._source = source
-
-        # Watchdog: re-enable tap every 30s in case macOS silently disabled it
-        import objc
-
-        def _watchdog_check(timer):
-            if listener._tap:
-                enabled = Quartz.CGEventTapIsEnabled(listener._tap)
-                if not enabled:
-                    _log("Watchdog: CGEventTap was disabled — re-enabling")
-                    Quartz.CGEventTapEnable(listener._tap, True)
-
-        self._watchdog = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-            30.0, None, None, None, True
-        )
-        # Can't easily use NSTimer with a Python function, use a different approach
-        self._watchdog.invalidate()
-        self._watchdog = None
 
         # Use a threading timer instead for the watchdog
         import threading

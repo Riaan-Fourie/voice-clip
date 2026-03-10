@@ -2,7 +2,7 @@
 
 macOS speech-to-text tool. Hold Right Command to record, release to transcribe, result auto-pastes into the focused window.
 
-Runs entirely locally on Apple Silicon using mlx-whisper (Metal GPU). No cloud APIs, no internet required.
+Runs locally on Apple Silicon using mlx-whisper (Metal GPU). No cloud APIs. Internet is only needed once for the first model download.
 
 ## How It Works
 
@@ -24,23 +24,42 @@ Runs entirely locally on Apple Silicon using mlx-whisper (Metal GPU). No cloud A
 
 - macOS (Apple Silicon)
 - Python 3.10+
-- **Accessibility permission** for the terminal/app running it (for CGEventTap)
+- **Accessibility permission** for VoiceClip/terminal (for CGEventTap)
+- **Microphone permission** (macOS prompt on first recording)
 
-## Setup
+## Install
 
+```bash
+./install.sh
+```
+
+Installer output:
+- Creates `~/.voiceclip` (app + venv)
+- Creates `/Applications/VoiceClip.app`
+- Removes any legacy LaunchAgent from older installs
+
+## Usage
+
+Installed app:
+- Launch `/Applications/VoiceClip.app`
+
+Development run from this repo:
 ```bash
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-```
-
-## Usage
-
-```bash
 ./venv/bin/python main.py
 ```
 
-Do **not** use LaunchAgent — CGEventTap requires Accessibility permission which doesn't carry over through launchd.
+Do **not** run VoiceClip via LaunchAgent/`launchd` for hotkey capture.
+
+Optional auto-start: add `/Applications/VoiceClip.app` to Login Items.
+
+## Uninstall
+
+```bash
+./install.sh --uninstall
+```
 
 ## Key Design Decisions
 

@@ -1,9 +1,9 @@
 #!/bin/bash
 # VoiceClip Installer
-# Installs VoiceClip as a macOS menubar app with auto-start on login.
+# Installs VoiceClip as a macOS menubar app.
 #
 # Requirements: macOS 13+, Apple Silicon, Python 3.10+
-# Usage: ./install.sh
+# Usage: ./install.sh [--uninstall]
 
 set -e
 
@@ -11,9 +11,19 @@ INSTALL_DIR="$HOME/.voiceclip"
 APP_DIR="$INSTALL_DIR/app"
 VENV_DIR="$INSTALL_DIR/venv"
 BUNDLE_DIR="/Applications/VoiceClip.app"
-LAUNCH_AGENT="$HOME/Library/LaunchAgents/com.riaanfourie.voiceclip.plist"
+LEGACY_LAUNCH_AGENT="$HOME/Library/LaunchAgents/com.riaanfourie.voiceclip.plist"
 LOG_DIR="$HOME/.voice-clip"
 SOURCE_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+if [[ "$1" == "--uninstall" ]]; then
+    echo "Uninstalling VoiceClip..."
+    launchctl unload "$LEGACY_LAUNCH_AGENT" 2>/dev/null || true
+    rm -f "$LEGACY_LAUNCH_AGENT"
+    rm -rf "$BUNDLE_DIR"
+    rm -rf "$INSTALL_DIR"
+    echo "VoiceClip uninstalled. Logs at $LOG_DIR were kept."
+    exit 0
+fi
 
 echo "=============================="
 echo "  VoiceClip Installer"
@@ -121,38 +131,9 @@ cat > "$BUNDLE_DIR/Contents/Info.plist" << 'PLIST'
 </plist>
 PLIST
 
-# LaunchAgent for auto-start
-echo "Setting up auto-start on login..."
-cat > "$LAUNCH_AGENT" << PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.riaanfourie.voiceclip</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$INSTALL_DIR/run.sh</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>LimitLoadToSessionType</key>
-    <string>Aqua</string>
-    <key>ProcessType</key>
-    <string>Interactive</string>
-    <key>StandardOutPath</key>
-    <string>$LOG_DIR/voiceclip.log</string>
-    <key>StandardErrorPath</key>
-    <string>$LOG_DIR/voiceclip.error.log</string>
-</dict>
-</plist>
-PLIST
-
-# Load the LaunchAgent
-launchctl unload "$LAUNCH_AGENT" 2>/dev/null || true
-launchctl load -w "$LAUNCH_AGENT"
+# Clean up legacy LaunchAgent from older installs
+launchctl unload "$LEGACY_LAUNCH_AGENT" 2>/dev/null || true
+rm -f "$LEGACY_LAUNCH_AGENT"
 
 echo ""
 echo "=============================="
@@ -173,16 +154,7 @@ echo "  1. Accessibility — System Settings > Privacy > Accessibility"
 echo "     Add 'VoiceClip' or grant to Terminal/iTerm"
 echo "  2. Microphone — macOS will prompt on first recording"
 echo ""
+echo "  Optional auto-start: add /Applications/VoiceClip.app to Login Items."
+echo ""
 echo "  To uninstall: ./install.sh --uninstall"
 echo ""
-
-# Handle --uninstall flag
-if [[ "$1" == "--uninstall" ]]; then
-    echo "Uninstalling VoiceClip..."
-    launchctl unload "$LAUNCH_AGENT" 2>/dev/null || true
-    rm -f "$LAUNCH_AGENT"
-    rm -rf "$BUNDLE_DIR"
-    rm -rf "$INSTALL_DIR"
-    echo "VoiceClip uninstalled. Logs at $LOG_DIR were kept."
-    exit 0
-fi
