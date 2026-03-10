@@ -26,8 +26,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$VERSION" ]]; then
-    # Read from git tag, or fall back to 1.0.0
-    VERSION=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo "1.0.0")
+    VERSION=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')
+    VERSION="${VERSION:-1.0.0}"
 fi
 
 echo "▶ Building VoiceClip v$VERSION"
@@ -43,36 +43,76 @@ source venv/bin/activate
 echo "▶ Installing build deps..."
 pip install -q --upgrade pip
 pip install -q -r requirements.txt
-pip install -q py2app
+pip install -q pyinstaller
 
-# ── py2app build ──────────────────────────────────────────────────────────────
-echo "▶ Running py2app..."
-rm -rf dist build_py2app
+# ── PyInstaller build ─────────────────────────────────────────────────────────
+echo "▶ Running PyInstaller..."
+rm -rf dist build_pyinstaller
 
-# Stamp version into setup_app.py via env var (read by setup_app.py if present)
-export VOICECLIP_VERSION="$VERSION"
-
-python setup_app.py py2app --dist-dir dist --build-dir build_py2app 2>&1
+pyinstaller \
+    --name VoiceClip \
+    --windowed \
+    --noconfirm \
+    --distpath dist \
+    --workpath build_pyinstaller \
+    --osx-bundle-identifier com.riaanfourie.voiceclip \
+    --collect-all mlx \
+    --collect-all mlx_whisper \
+    --collect-all rumps \
+    --collect-all sounddevice \
+    --collect-all huggingface_hub \
+    --collect-all tokenizers \
+    --collect-all safetensors \
+    --hidden-import objc \
+    --hidden-import AppKit \
+    --hidden-import Foundation \
+    --hidden-import Quartz \
+    --hidden-import PyObjCTools \
+    --exclude-module torch \
+    --exclude-module scipy \
+    --exclude-module numba \
+    --exclude-module llvmlite \
+    --exclude-module tensorflow \
+    --exclude-module keras \
+    --exclude-module sklearn \
+    --exclude-module pandas \
+    --exclude-module matplotlib \
+    main.py 2>&1
 
 APP_PATH="dist/VoiceClip.app"
 
 if [[ ! -d "$APP_PATH" ]]; then
-    echo "✗ py2app failed — dist/VoiceClip.app not found"
+    echo "✗ PyInstaller failed — dist/VoiceClip.app not found"
     exit 1
 fi
 
-echo "▶ py2app succeeded: $APP_PATH"
+echo "▶ PyInstaller succeeded: $APP_PATH"
+
+# ── Patch Info.plist ──────────────────────────────────────────────────────────
+# PyInstaller creates a basic Info.plist; we patch in required macOS keys
+echo "▶ Patching Info.plist..."
+PLIST="$APP_PATH/Contents/Info.plist"
+
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$PLIST" 2>/dev/null || \
+    /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $VERSION" "$PLIST"
+
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$PLIST" 2>/dev/null || \
+    /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $VERSION" "$PLIST"
+
+# Hide from Dock (menubar-only app)
+/usr/libexec/PlistBuddy -c "Set :LSUIElement true" "$PLIST" 2>/dev/null || \
+    /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$PLIST"
+
+# Microphone usage description (required for permission prompt)
+/usr/libexec/PlistBuddy -c "Set :NSMicrophoneUsageDescription 'VoiceClip needs microphone access to record your voice for speech-to-text.'" "$PLIST" 2>/dev/null || \
+    /usr/libexec/PlistBuddy -c "Add :NSMicrophoneUsageDescription string 'VoiceClip needs microphone access to record your voice for speech-to-text.'" "$PLIST"
+
+echo "▶ Info.plist patched"
 
 # ── Ad-hoc code sign ─────────────────────────────────────────────────────────
 echo "▶ Ad-hoc signing (codesign)..."
 codesign --deep --force --sign - "$APP_PATH"
 echo "▶ Signed"
-
-# ── Bundle Whisper model ──────────────────────────────────────────────────────
-# The model is downloaded by mlx-whisper on first run to ~/.cache/huggingface/
-# We do NOT bundle it in the .app to keep the .dmg small (~50MB vs ~200MB).
-# Users see a one-time download notice on first use.
-echo "▶ Skipping model bundle (downloads on first run)"
 
 # ── Create .dmg ───────────────────────────────────────────────────────────────
 echo "▶ Creating .dmg..."

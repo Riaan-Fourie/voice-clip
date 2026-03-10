@@ -7,4 +7,6 @@ failed_recordings/
 # Build artifacts
 dist/
 build_py2app/
+build_pyinstaller/
 *.dmg
+*.spec
