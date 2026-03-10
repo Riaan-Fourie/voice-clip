@@ -68,10 +68,9 @@ pyinstaller \
     --hidden-import Foundation \
     --hidden-import Quartz \
     --hidden-import PyObjCTools \
+    --collect-all numba \
+    --collect-all llvmlite \
     --exclude-module torch \
-    --exclude-module scipy \
-    --exclude-module numba \
-    --exclude-module llvmlite \
     --exclude-module tensorflow \
     --exclude-module keras \
     --exclude-module sklearn \
@@ -108,6 +107,14 @@ PLIST="$APP_PATH/Contents/Info.plist"
     /usr/libexec/PlistBuddy -c "Add :NSMicrophoneUsageDescription string 'VoiceClip needs microphone access to record your voice for speech-to-text.'" "$PLIST"
 
 echo "▶ Info.plist patched"
+
+# ── Strip quarantine ─────────────────────────────────────────────────────────
+# Removes the com.apple.quarantine xattr so the locally built app launches
+# without Gatekeeper blocking it. (Downloaded DMGs will still get quarantine
+# applied by the browser — that's expected for unsigned apps.)
+echo "▶ Stripping quarantine xattr..."
+xattr -dr com.apple.quarantine "$APP_PATH" 2>/dev/null || true
+echo "▶ Quarantine stripped"
 
 # ── Ad-hoc code sign ─────────────────────────────────────────────────────────
 echo "▶ Ad-hoc signing (codesign)..."
