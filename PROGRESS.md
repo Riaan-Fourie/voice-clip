@@ -18,3 +18,15 @@
 - Increased VU meter sensitivity (divisor 8000 → 1500)
 - Changed overlay from NSWindow to NSPanel for fullscreen rendering
 - Added auto-paste via simulated Cmd+V after transcription
+
+## 2026-03-10 — Public Release Readiness
+- Replaced risky stale-process killing in `main.py` with safe single-instance file locking.
+- Ensured `~/.voice-clip` exists before writing runtime logs.
+- `hotkey.py`: modifier-only `flagsChanged` handling for Right Command.
+- `overlay.py`: correct NSTimer selector signature + main-thread show/hide robustness.
+- `install.sh` is canonical and handles `--uninstall` first.
+- Removed LaunchAgent-based startup from install flow.
+- Cleans up legacy LaunchAgent from older installs.
+- Simplified `setup.sh` to a deprecated wrapper that forwards to `install.sh`.
+- Updated docs (`README.md`, `CLAUDE.md`) to match actual runtime behavior and permissions.
+- Added `LICENSE` (MIT).

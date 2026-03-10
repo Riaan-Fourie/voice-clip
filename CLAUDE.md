@@ -3,6 +3,12 @@
 ## Overview
 macOS speech-to-text app. Hold Right Command key to record, release to transcribe, result auto-pastes into focused window. Replaces Whispr Flow.
 
+## Recent Update (2026-03-10)
+- Runtime hardening: single-instance lock + guaranteed log directory creation.
+- Installer hardening: `install.sh` is canonical, `--uninstall` handled first, legacy LaunchAgent removed.
+- Behavior/docs consistency: startup guidance now explicitly avoids LaunchAgent/launchd for hotkey capture.
+- Added MIT `LICENSE`.
+
 ## Architecture
 - **main.py** — rumps menubar app + CGEventTap hotkey + glue logic + auto-paste via simulated Cmd+V
 - **recorder.py** — sounddevice audio capture (MacBook Air mic preferred), RMS level callback for VU meter
