@@ -2,6 +2,14 @@
 
 macOS speech-to-text tool. Hold Right Command to record, release to transcribe, result auto-pastes into the focused window.
 
+## Download
+
+**[→ Download latest VoiceClip.dmg](../../releases/latest)**
+
+> Requires Apple Silicon (M1/M2/M3/M4) and macOS 13+.
+>
+> **First launch:** macOS will warn "unidentified developer" — right-click → Open to bypass it. You only need to do this once.
+
 Runs locally on Apple Silicon using mlx-whisper (Metal GPU). No cloud APIs. Internet is only needed once for the first model download.
 
 ## How It Works

@@ -1,0 +1,52 @@
+name: Release
+
+# Triggers when you push a tag like v1.0.0
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-macos:
+    name: Build macOS DMG
+    runs-on: macos-latest  # Apple Silicon runner (M1)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Build DMG
+        run: ./build/build_macos.sh --version ${{ steps.version.outputs.VERSION }}
+
+      - name: Upload DMG to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/VoiceClip-v${{ steps.version.outputs.VERSION }}.dmg
+          body: |
+            ## VoiceClip v${{ steps.version.outputs.VERSION }}
+
+            ### Install
+            1. Download `VoiceClip-v${{ steps.version.outputs.VERSION }}.dmg`
+            2. Open it and drag VoiceClip to Applications
+            3. Launch VoiceClip from Applications
+            4. Go to **System Settings → Privacy & Security → Accessibility** and enable VoiceClip
+            5. Hold **Right Command** to record, release to transcribe
+
+            > **Note:** macOS will warn "unidentified developer" on first launch.
+            > Right-click → Open to bypass it. You only need to do this once.
+
+            ### Requirements
+            - Apple Silicon Mac (M1/M2/M3/M4)
+            - macOS 13 Ventura or later
+            - ~150MB free for the Whisper model (downloaded on first use)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
