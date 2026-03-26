@@ -75,3 +75,7 @@ Optional auto-start: add `/Applications/VoiceClip.app` to Login Items.
 - **CGEventTap** over pynput/NSEvent — pynput needs Input Monitoring; NSEvent can't detect modifier-only keys; CGEventTap works with Accessibility only
 - **Right Command** over Fn — macOS intercepts Fn for dictation/emoji
 - **NSPanel** over NSWindow — NSPanel floats above fullscreen spaces
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full module breakdown, threading model, and design rationale.
+See [GOTCHAS.md](GOTCHAS.md) for macOS-specific pitfalls and workarounds.
+See [CHANGELOG.md](CHANGELOG.md) for version history.

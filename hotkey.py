@@ -3,9 +3,10 @@ Attaches to the MAIN thread's run loop (required for HID event delivery).
 Only requires Accessibility permission.
 """
 
-import os
 import time
 import Quartz
+
+from utils import _log as _log_base
 
 # Right Command key = keyCode 54
 HOTKEY_KEYCODE = 54
@@ -17,15 +18,9 @@ MIN_HOLD_DURATION = 0.15
 # Cooldown: minimum gap between end of one recording and start of next (seconds)
 COOLDOWN_AFTER_RELEASE = 0.5
 
-STATE_DIR = os.path.expanduser("~/.voice-clip")
-LOG_PATH = os.path.join(STATE_DIR, "voiceclip-debug.log")
-
 
 def _log(msg):
-    os.makedirs(STATE_DIR, exist_ok=True)
-    with open(LOG_PATH, "a") as f:
-        from datetime import datetime
-        f.write(f"{datetime.now().isoformat()} [hotkey] {msg}\n")
+    _log_base(msg, tag="hotkey")
 
 
 class HotkeyListener:

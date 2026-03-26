@@ -21,9 +21,8 @@ from recorder import Recorder
 from transcriber import Transcriber
 from overlay import RecordingOverlay
 from hotkey import HotkeyListener
+from utils import _log, STATE_DIR, LOG_PATH
 
-STATE_DIR = os.path.expanduser("~/.voice-clip")
-LOG_PATH = os.path.join(STATE_DIR, "voiceclip-debug.log")
 PID_FILE = os.path.join(STATE_DIR, "voiceclip.pid")
 _instance_lock_fd = None
 
@@ -35,13 +34,6 @@ logging.basicConfig(
     format="%(asctime)s %(message)s",
 )
 log = logging.getLogger("voiceclip")
-
-
-def _log(msg):
-    """Write directly to log file (no buffering issues)."""
-    with open(LOG_PATH, "a") as f:
-        from datetime import datetime
-        f.write(f"{datetime.now().isoformat()} {msg}\n")
 
 
 class VoiceClipApp(rumps.App):

@@ -1,17 +1,12 @@
 """Floating VU meter overlay — shows live audio level bars while recording."""
 
-import os
 import threading
-from datetime import datetime
 
-STATE_DIR = os.path.expanduser("~/.voice-clip")
-LOG_PATH = os.path.join(STATE_DIR, "voiceclip-debug.log")
+from utils import _log as _log_base
 
 
 def _log(msg):
-    os.makedirs(STATE_DIR, exist_ok=True)
-    with open(LOG_PATH, "a") as f:
-        f.write(f"{datetime.now().isoformat()} [overlay] {msg}\n")
+    _log_base(msg, tag="overlay")
 
 import objc
 from AppKit import (

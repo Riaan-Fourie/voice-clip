@@ -4,9 +4,18 @@ __pycache__/
 .DS_Store
 failed_recordings/
 
-# Build artifacts
+# Build output
 dist/
 build_py2app/
 build_pyinstaller/
 *.dmg
 *.spec
+
+# App bundle (built artifact)
+VoiceClip.app/
+
+# Test
+.pytest_cache/
+
+# Runtime
+*.pid

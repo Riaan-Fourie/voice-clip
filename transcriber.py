@@ -3,13 +3,12 @@
 import os
 import tempfile
 import threading
-from datetime import datetime
 
 import mlx_whisper
 
-STATE_DIR = os.path.expanduser("~/.voice-clip")
-FAILED_DIR = os.path.expanduser("~/.voice-clip/failed")
-LOG_PATH = os.path.join(STATE_DIR, "voiceclip-debug.log")
+from utils import _log as _log_base, STATE_DIR
+
+FAILED_DIR = os.path.join(STATE_DIR, "failed")
 
 # Use "base" model — good balance of speed and accuracy (~150MB)
 # "tiny" is faster but less accurate (~75MB)
@@ -17,9 +16,7 @@ MODEL = "mlx-community/whisper-base-mlx"
 
 
 def _log(msg):
-    os.makedirs(STATE_DIR, exist_ok=True)
-    with open(LOG_PATH, "a") as f:
-        f.write(f"{datetime.now().isoformat()} [transcriber] {msg}\n")
+    _log_base(msg, tag="transcriber")
 
 
 class Transcriber:
