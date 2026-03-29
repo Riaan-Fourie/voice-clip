@@ -2,6 +2,10 @@
 
 macOS speech-to-text tool. Hold Right Command to record, release to transcribe, result auto-pastes into the focused window.
 
+## Demo
+
+https://github.com/Riaan-Fourie/voice-clip/raw/main/demo/voiceclip-demo.mp4
+
 ## Download
 
 **[→ Download latest VoiceClip.dmg](../../releases/latest)**
