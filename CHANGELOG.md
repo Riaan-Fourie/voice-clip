@@ -10,6 +10,9 @@ All notable changes to VoiceClip are documented here.
 - Converted `CLAUDE.md` to `ARCHITECTURE.md`.
 - Added basic pytest test suite.
 
+### Fixed
+- Call `mlx.core.clear_cache()` after every transcription to release Metal GPU workspace buffers. Without this, IOAccelerator pages accumulate across calls — a single idle VoiceClip was observed at ~1.6 GB footprint (1.4 GB of it GPU tensors). Weights stay warm; only transient compute memory is freed.
+
 ## [0.2.0] — 2026-03-10
 
 ### Changed

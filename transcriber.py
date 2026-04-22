@@ -5,6 +5,7 @@ import tempfile
 import threading
 from datetime import datetime
 
+import mlx.core as mx
 import mlx_whisper
 
 from utils import _log as _log_base, STATE_DIR
@@ -52,6 +53,7 @@ class Transcriber:
 
                 mlx_whisper.transcribe(tmp.name, path_or_hf_repo=MODEL)
                 os.unlink(tmp.name)
+                mx.clear_cache()
                 self._model_loaded = True
                 _log("Whisper model loaded successfully")
             except Exception as e:
@@ -107,6 +109,10 @@ class Transcriber:
             error_msg = str(e)
             self._save_failed(wav_bytes, error_msg)
             return None, error_msg
+        finally:
+            # Release MLX workspace buffers (KV cache, activations).
+            # Weights stay warm — only transient compute memory is freed.
+            mx.clear_cache()
 
     def _do_transcribe(self, filepath, wav_bytes, callback):
         """Async transcription wrapper."""
