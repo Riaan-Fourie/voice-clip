@@ -7,14 +7,14 @@ from datetime import datetime
 
 import mlx.core as mx
 import mlx_whisper
+import noisereduce as nr
+import soundfile as sf
 
 from utils import _log as _log_base, STATE_DIR
 
 FAILED_DIR = os.path.join(STATE_DIR, "failed")
 
-# Use "base" model — good balance of speed and accuracy (~150MB)
-# "tiny" is faster but less accurate (~75MB)
-MODEL = "mlx-community/whisper-base-mlx"
+MODEL = "mlx-community/whisper-small.en-mlx"
 
 
 def _log(msg):
@@ -89,6 +89,9 @@ class Transcriber:
         """Synchronous transcription."""
         try:
             _log(f"Transcribing {filepath}")
+            audio, sr = sf.read(filepath)
+            audio = nr.reduce_noise(y=audio, sr=sr, stationary=True, prop_decrease=0.5)
+            sf.write(filepath, audio, sr)
             result = mlx_whisper.transcribe(filepath, path_or_hf_repo=MODEL)
             text = result.get("text", "").strip()
             _log(f"Transcription result: {text[:80]}")
