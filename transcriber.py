@@ -1,102 +1,146 @@
 """Speech-to-text using mlx-whisper (local Whisper on Apple Silicon via Metal GPU)."""
 
+import io
 import os
-import tempfile
 import threading
+import wave
 from datetime import datetime
 
 import mlx.core as mx
 import mlx_whisper
-import noisereduce as nr
-import soundfile as sf
+import numpy as np
 
 from utils import _log as _log_base, STATE_DIR
 
 FAILED_DIR = os.path.join(STATE_DIR, "failed")
+PROPER_NOUNS_PATH = os.path.join(STATE_DIR, "proper_nouns.txt")
 
-MODEL = "mlx-community/whisper-small.en-mlx"
+# whisper-large-v3-turbo: large-model accuracy at ~5-8x large-v3 speed.
+# Switch to "mlx-community/whisper-small.en-mlx" if turbo feels slow on your Mac.
+MODEL = "mlx-community/whisper-large-v3-turbo"
+
+DEFAULT_PROPER_NOUNS = """# VoiceClip proper nouns — biases Whisper toward these tokens.
+# One entry per line. Add names, jargon, abbreviations Whisper keeps mishearing.
+# Comments (#) and blank lines are ignored. Whisper truncates at ~224 tokens.
+
+Dewald
+Riaan
+Fourie
+HashDirectors
+SumSub
+Hetzner
+Havoc
+Kennet
+FBAR
+Cayman
+Supabase
+Vercel
+Monday.com
+Sølūnâ
+Affinity
+Inven
+Telegram
+Matrix
+Beeper
+mlx
+Whisper
+"""
 
 
 def _log(msg):
     _log_base(msg, tag="transcriber")
 
 
+def _load_proper_nouns() -> str:
+    """Read the user-editable proper nouns file. Create it with defaults if missing.
+
+    Returns a comma-joined string suitable for Whisper's `initial_prompt` kwarg.
+    """
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if not os.path.exists(PROPER_NOUNS_PATH):
+        with open(PROPER_NOUNS_PATH, "w") as f:
+            f.write(DEFAULT_PROPER_NOUNS)
+        _log(f"Created default proper nouns file at {PROPER_NOUNS_PATH}")
+    try:
+        with open(PROPER_NOUNS_PATH) as f:
+            words = [
+                line.strip()
+                for line in f
+                if line.strip() and not line.strip().startswith("#")
+            ]
+        return ", ".join(words)
+    except Exception as e:
+        _log(f"Failed to read proper nouns file: {e}")
+        return ""
+
+
+def _wav_bytes_to_float32(wav_bytes: bytes) -> np.ndarray:
+    """Decode 16-bit mono WAV bytes into a float32 numpy array in [-1, 1].
+
+    Bypasses the disk round-trip mlx-whisper would otherwise force.
+    """
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        raw = wf.readframes(wf.getnframes())
+    return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+
 class Transcriber:
     def __init__(self):
         self._model_loaded = False
         self._init_lock = threading.Lock()
+        self._initial_prompt = _load_proper_nouns()
+        if self._initial_prompt:
+            count = len([w for w in self._initial_prompt.split(",") if w.strip()])
+            _log(f"Loaded {count} proper nouns for initial_prompt")
 
     def _ensure_init(self):
-        """Lazy init — download/load model on first use."""
+        """Lazy init — download/load model on first use by transcribing a short silence."""
         with self._init_lock:
             if self._model_loaded:
                 return
             try:
                 _log(f"Loading Whisper model: {MODEL}")
-                # Warm up the model by transcribing silence
-                # This triggers the model download if needed
-                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-                # Write minimal valid WAV header (silence)
-                import struct
-                sr = 16000
-                duration = 0.1
-                n_samples = int(sr * duration)
-                data_size = n_samples * 2
-                tmp.write(b'RIFF')
-                tmp.write(struct.pack('<I', 36 + data_size))
-                tmp.write(b'WAVEfmt ')
-                tmp.write(struct.pack('<IHHIIHH', 16, 1, 1, sr, sr * 2, 2, 16))
-                tmp.write(b'data')
-                tmp.write(struct.pack('<I', data_size))
-                tmp.write(b'\x00' * data_size)
-                tmp.close()
-
-                mlx_whisper.transcribe(tmp.name, path_or_hf_repo=MODEL)
-                os.unlink(tmp.name)
+                silence = np.zeros(1600, dtype=np.float32)  # 0.1s @ 16kHz
+                mlx_whisper.transcribe(silence, path_or_hf_repo=MODEL)
                 mx.clear_cache()
                 self._model_loaded = True
                 _log("Whisper model loaded successfully")
             except Exception as e:
                 _log(f"Failed to load Whisper model: {e}")
-                try:
-                    os.unlink(tmp.name)
-                except:
-                    pass
+
+    def reload_proper_nouns(self):
+        """Re-read the proper nouns file. Call after editing it at runtime."""
+        self._initial_prompt = _load_proper_nouns()
 
     def transcribe(self, wav_bytes: bytes, callback=None):
-        """
-        Transcribe WAV bytes using mlx-whisper.
+        """Transcribe WAV bytes using mlx-whisper.
+
         callback(text, error) is called when done.
         If callback is None, blocks and returns (text, error).
         """
         self._ensure_init()
 
-        # Write wav to temp file
-        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        tmp.write(wav_bytes)
-        tmp.close()
-
         if callback:
             threading.Thread(
                 target=self._do_transcribe,
-                args=(tmp.name, wav_bytes, callback),
+                args=(wav_bytes, callback),
                 daemon=True,
             ).start()
         else:
-            return self._do_transcribe_sync(tmp.name, wav_bytes)
+            return self._do_transcribe_sync(wav_bytes)
 
-    def _do_transcribe_sync(self, filepath, wav_bytes):
-        """Synchronous transcription."""
+    def _do_transcribe_sync(self, wav_bytes):
+        """Synchronous transcription. Audio is decoded in memory; no disk round-trip."""
         try:
-            _log(f"Transcribing {filepath}")
-            audio, sr = sf.read(filepath)
-            audio = nr.reduce_noise(y=audio, sr=sr, stationary=True, prop_decrease=0.5)
-            sf.write(filepath, audio, sr)
-            result = mlx_whisper.transcribe(filepath, path_or_hf_repo=MODEL)
+            audio = _wav_bytes_to_float32(wav_bytes)
+            _log(f"Transcribing {len(audio) / 16000:.1f}s of audio")
+            result = mlx_whisper.transcribe(
+                audio,
+                path_or_hf_repo=MODEL,
+                initial_prompt=self._initial_prompt or None,
+            )
             text = result.get("text", "").strip()
             _log(f"Transcription result: {text[:80]}")
-
-            os.unlink(filepath)
 
             if text:
                 return text, None
@@ -105,10 +149,6 @@ class Transcriber:
                 return None, "No speech detected"
         except Exception as e:
             _log(f"Transcription error: {e}")
-            try:
-                os.unlink(filepath)
-            except OSError:
-                pass
             error_msg = str(e)
             self._save_failed(wav_bytes, error_msg)
             return None, error_msg
@@ -117,9 +157,9 @@ class Transcriber:
             # Weights stay warm — only transient compute memory is freed.
             mx.clear_cache()
 
-    def _do_transcribe(self, filepath, wav_bytes, callback):
+    def _do_transcribe(self, wav_bytes, callback):
         """Async transcription wrapper."""
-        text, error = self._do_transcribe_sync(filepath, wav_bytes)
+        text, error = self._do_transcribe_sync(wav_bytes)
         callback(text, error)
 
     def _save_failed(self, wav_bytes: bytes, error_msg: str):
