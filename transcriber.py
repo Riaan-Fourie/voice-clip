@@ -15,9 +15,10 @@ from utils import _log as _log_base, STATE_DIR
 FAILED_DIR = os.path.join(STATE_DIR, "failed")
 PROPER_NOUNS_PATH = os.path.join(STATE_DIR, "proper_nouns.txt")
 
-# whisper-large-v3-turbo: large-model accuracy at ~5-8x large-v3 speed.
-# Switch to "mlx-community/whisper-small.en-mlx" if turbo feels slow on your Mac.
-MODEL = "mlx-community/whisper-large-v3-turbo"
+# whisper-small.en-mlx: small + English-only, fastest viable for live dictation
+# on Apple Silicon. Swap to "mlx-community/whisper-large-v3-turbo" if you want
+# stronger non-English-name accuracy at the cost of 2-3x latency.
+MODEL = "mlx-community/whisper-small.en-mlx"
 
 DEFAULT_PROPER_NOUNS = """# VoiceClip proper nouns — biases Whisper toward these tokens.
 # One entry per line. Add names, jargon, abbreviations Whisper keeps mishearing.
