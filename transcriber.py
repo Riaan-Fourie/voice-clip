@@ -15,10 +15,11 @@ from utils import _log as _log_base, STATE_DIR
 FAILED_DIR = os.path.join(STATE_DIR, "failed")
 PROPER_NOUNS_PATH = os.path.join(STATE_DIR, "proper_nouns.txt")
 
-# whisper-small.en-mlx: small + English-only, fastest viable for live dictation
-# on Apple Silicon. Swap to "mlx-community/whisper-large-v3-turbo" if you want
-# stronger non-English-name accuracy at the cost of 2-3x latency.
-MODEL = "mlx-community/whisper-small.en-mlx"
+# distil-whisper-large-v3: English-only distillation of large-v3 — near
+# large-v3 accuracy at ~23x realtime on M5 (benchmarked 2026-06-11; small.en
+# was 46x but noticeably weaker on names/jargon). Swap back to
+# "mlx-community/whisper-small.en-mlx" if latency ever becomes a problem.
+MODEL = "mlx-community/distil-whisper-large-v3"
 
 DEFAULT_PROPER_NOUNS = """# VoiceClip proper nouns — biases Whisper toward these tokens.
 # One entry per line. Add names, jargon, abbreviations Whisper keeps mishearing.
@@ -45,6 +46,9 @@ Matrix
 Beeper
 mlx
 Whisper
+NDA
+Wilsch
+Marius
 """
 
 
