@@ -8,7 +8,7 @@ All notable changes to VoiceClip are documented here.
 - `~/.voice-clip/proper_nouns.txt` — user-editable list piped into Whisper's `initial_prompt`. Fixes recurring misreads of names and jargon (e.g. "Dewald", "HashDirectors", "SumSub"). Auto-created with sensible defaults on first run. Edit and call `Transcriber.reload_proper_nouns()` to refresh without restart.
 
 ### Changed
-- Swapped default model from `whisper-small.en-mlx` to `whisper-large-v3-turbo`. Large-model accuracy at ~5-8x large-v3 speed; multilingual base also handles non-English names better than the `.en` variant.
+- Swapped default model from `whisper-small.en-mlx` to `distil-whisper-large-v3` (2026-06-11). Near large-v3 accuracy, English-only. Benchmarked on M5: 23x realtime vs small.en's 46x — latency difference imperceptible for short dictations. (Earlier `large-v3-turbo` attempt was reverted on the old machine for being too slow.)
 - Decode WAV audio in memory and pass numpy arrays directly to `mlx_whisper.transcribe()`. Removes three disk round-trips per transcription.
 - Extracted shared `_log()` function into `utils.py` (was duplicated across all modules).
 - Moved `test_keys.py` to `scripts/test_keys.py`.
