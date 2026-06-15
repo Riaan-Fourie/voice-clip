@@ -15,11 +15,16 @@ from utils import _log as _log_base, STATE_DIR
 FAILED_DIR = os.path.join(STATE_DIR, "failed")
 PROPER_NOUNS_PATH = os.path.join(STATE_DIR, "proper_nouns.txt")
 
-# distil-whisper-large-v3: English-only distillation of large-v3 — near
-# large-v3 accuracy at ~23x realtime on M5 (benchmarked 2026-06-11; small.en
-# was 46x but noticeably weaker on names/jargon). Swap back to
-# "mlx-community/whisper-small.en-mlx" if latency ever becomes a problem.
-MODEL = "mlx-community/distil-whisper-large-v3"
+# whisper-small.en: English-only, ~459MB resident (vs distil-large-v3's 1.4GB).
+# mlx_whisper pins the whole model in RAM for the process lifetime (ModelHolder
+# singleton). On this 16GB Mac, distil-large-v3 was fast *only while warm* — when
+# idle its weights got paged to swap, so the next dictation stalled faulting them
+# back in (diagnosed 2026-06-15; pmset showed zero thermal throttle — it was RAM,
+# not heat). small.en is small enough to survive memory pressure → always instant.
+# Slightly weaker on names/jargon, but the proper_nouns initial_prompt mitigates.
+# Swap back to "mlx-community/distil-whisper-large-v3" if you have RAM headroom and
+# want maximum accuracy.
+MODEL = "mlx-community/whisper-small.en-mlx"
 
 DEFAULT_PROPER_NOUNS = """# VoiceClip proper nouns — biases Whisper toward these tokens.
 # One entry per line. Add names, jargon, abbreviations Whisper keeps mishearing.
