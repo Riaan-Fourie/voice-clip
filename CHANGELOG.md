@@ -20,6 +20,7 @@ All notable changes to VoiceClip are documented here.
 - `soundfile` dependency (no longer needed once disk round-trip was removed).
 
 ### Fixed
+- **Hotkey going silently dead after a long hold (issue #156).** The CGEventTap callback ran on the main run loop and invoked the press/release handlers synchronously — `recorder.stop()` (closing the audio stream + assembling the WAV) could block it past macOS's tap timeout, after which macOS disabled the tap and a plain `CGEventTapEnable` never restored event delivery. Two fixes: (1) press/release handlers are now dispatched to worker threads so the tap callback always returns instantly; (2) the watchdog now *recreates* the tap (tears down the source and rebuilds it) when a re-enable doesn't stick, on a 5s interval instead of 30s. Witnessed via `tests/manual_selfheal.py`.
 - Call `mlx.core.clear_cache()` after every transcription to release Metal GPU workspace buffers. Without this, IOAccelerator pages accumulate across calls — a single idle VoiceClip was observed at ~1.6 GB footprint (1.4 GB of it GPU tensors). Weights stay warm; only transient compute memory is freed.
 
 ## [0.2.0] — 2026-03-10

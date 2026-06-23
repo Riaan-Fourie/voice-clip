@@ -33,6 +33,19 @@
 - Must call `CGEventTapCreate` + `CFRunLoopAddSource` on the main thread BEFORE `NSApplication.run()`
 - rumps.App.run() starts the NSApplication run loop, so attach the tap in __init__ before .run()
 
+### NEVER do blocking work in the tap callback (issue #156)
+- The tap callback runs on the main run loop. If it blocks longer than macOS's tap timeout (~1s), macOS disables the tap.
+- We hit this because the release handler called `recorder.stop()` (closing the PortAudio stream + assembling a 31s WAV) synchronously inside the callback. A long hold blew the timeout, the tap was disabled, and the app went silently dead while still "running".
+- **Solution: the callback only does cheap flag/debounce checks; press/release handlers are dispatched to worker threads (`HotkeyListener._dispatch`).**
+
+### A disabled tap may not recover from `CGEventTapEnable` alone — recreate it
+- Once the tap/source is wedged (run loop stops delivering events to it), re-enabling with `CGEventTapEnable(tap, True)` does NOT restore delivery — the old watchdog looped on this forever.
+- **Solution: the watchdog tears down the source (`CFRunLoopRemoveSource`) and rebuilds the tap from scratch (`_recreate_tap`) when a re-enable doesn't stick after a couple of checks.** When the run loop IS healthy, the in-callback re-enable handles transient disables instantly; recreation is the backstop for the wedged case.
+
+### Lazily-bound Quartz symbols can race when first touched from a background thread
+- `Quartz.CGEventTapIsEnabled` is only used by the watchdog thread. The first access went through pyobjc's lazy import and intermittently raised `KeyError` from a background thread.
+- **Solution: "warm up" such symbols by referencing them once on the main thread in `start()` before spawning the watchdog.**
+
 ## Audio
 
 ### AirPods mic produces poor transcription
