@@ -1,6 +1,7 @@
 rumps>=0.4.0
 sounddevice>=0.4.6
 numpy>=1.24.0
+soundfile>=0.12.0  # libsndfile fallback for non-PCM (float) WAVs — issue #170
 mlx-whisper>=0.4.0
 pyobjc-framework-Cocoa>=10.0
 pyobjc-framework-Quartz>=10.0

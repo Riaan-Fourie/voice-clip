@@ -85,13 +85,26 @@ def _load_proper_nouns() -> str:
 
 
 def _wav_bytes_to_float32(wav_bytes: bytes) -> np.ndarray:
-    """Decode 16-bit mono WAV bytes into a float32 numpy array in [-1, 1].
+    """Decode mono WAV bytes into a float32 numpy array in [-1, 1].
 
-    Bypasses the disk round-trip mlx-whisper would otherwise force.
+    Fast path: stdlib `wave` for 16-bit PCM (what our Recorder emits). Bypasses
+    the disk round-trip mlx-whisper would otherwise force.
+
+    Fallback: libsndfile via `soundfile` for any encoding `wave` rejects — notably
+    a format-3 IEEE-float WAV, which raises `wave.Error: unknown format: 3`. That
+    exception used to bubble up and (via the un-guarded UI thread) wedge the whole
+    app (issue #170); decoding it instead keeps dictation alive.
     """
-    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
-        raw = wf.readframes(wf.getnframes())
-    return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            raw = wf.readframes(wf.getnframes())
+        return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    except Exception:
+        import soundfile as sf  # lazy: only non-PCM inputs pay the import cost
+        data, _sr = sf.read(io.BytesIO(wav_bytes), dtype="float32", always_2d=False)
+        if data.ndim > 1:  # mix down any stray multi-channel input to mono
+            data = data.mean(axis=1)
+        return np.ascontiguousarray(data, dtype=np.float32)
 
 
 class Transcriber:

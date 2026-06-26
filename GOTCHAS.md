@@ -46,6 +46,17 @@
 - `Quartz.CGEventTapIsEnabled` is only used by the watchdog thread. The first access went through pyobjc's lazy import and intermittently raised `KeyError` from a background thread.
 - **Solution: "warm up" such symbols by referencing them once on the main thread in `start()` before spawning the watchdog.**
 
+## Transcription pipeline
+
+### A raised exception in the transcribe thread can wedge dictation forever (issue #170)
+- `_do_transcribe` runs on a daemon thread, mutates AppKit/rumps UI off the main thread, and the app gates new recordings on a `self._transcribing` flag.
+- The flag was cleared only as the *last statement* of `_do_transcribe`. If anything before it raised — a `unknown format: 3` WAV decode error, a `rumps.notification` failure, any off-main-thread UI call — the flag stayed `True`, and `_on_hotkey_press` then silently ignored every future key-press. The app looks alive (icon present, CGEventTap healthy) but does nothing. This is a *different* failure from the #156 tap-wedge.
+- **Solution: transcription runs through `_safe_transcribe`, which clears the flag in a `finally`.** Belt-and-suspenders: `_on_hotkey_press` force-resets the flag if it's been held past `TRANSCRIBE_STUCK_TIMEOUT` (30s), which also covers a true *hang* where `finally` never runs.
+
+### Whisper does not see only PCM — decode defensively
+- The Recorder always writes 16-bit PCM, but a format-3 (IEEE-float) WAV reached the decoder on 2026-06-26. Python's stdlib `wave` module is PCM-only and raises `wave.Error: unknown format: 3` for it.
+- **Solution: `_wav_bytes_to_float32` falls back to libsndfile (`soundfile`) for anything `wave` rejects** (lazy import — only the rare non-PCM path pays the cost). `soundfile` had been removed from `requirements.txt`; it's back for this.
+
 ## Audio
 
 ### AirPods mic produces poor transcription

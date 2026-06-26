@@ -12,6 +12,7 @@ import fcntl
 import os
 import subprocess
 import threading
+import time
 import logging
 import sys
 
@@ -25,6 +26,11 @@ from utils import _log, STATE_DIR, LOG_PATH
 
 PID_FILE = os.path.join(STATE_DIR, "voiceclip.pid")
 _instance_lock_fd = None
+
+# If a transcription has held the `_transcribing` gate longer than this, assume it
+# hung and let the next hotkey press force-recover (issue #170). small.en on this
+# Mac transcribes in well under a second; 30s is far beyond any real run.
+TRANSCRIBE_STUCK_TIMEOUT = 30.0
 
 os.makedirs(STATE_DIR, exist_ok=True)
 
@@ -52,6 +58,7 @@ class VoiceClipApp(rumps.App):
         _log("init: transcriber done")
         self._key_pressed = False
         self._transcribing = False
+        self._transcribe_started_at = 0.0  # monotonic ts; backstop for a hung transcribe
 
         # Build menu
         self.menu = [
@@ -73,7 +80,18 @@ class VoiceClipApp(rumps.App):
 
     def _on_hotkey_press(self):
         """Right Command pressed — start recording."""
-        if self._key_pressed or self._transcribing:
+        if self._transcribing:
+            # Backstop for a transcription that hung (never returned, so the
+            # `_safe_transcribe` finally never ran). Without this a single hung
+            # mlx_whisper call would silently kill dictation forever (issue #170).
+            stuck_for = time.monotonic() - self._transcribe_started_at
+            if stuck_for > TRANSCRIBE_STUCK_TIMEOUT:
+                log.warning(f"_transcribing stuck {stuck_for:.0f}s — force-resetting")
+                _log(f"_transcribing stuck {stuck_for:.0f}s — force-resetting")
+                self._transcribing = False
+            else:
+                return
+        if self._key_pressed:
             return
         log.info("Hotkey pressed — start recording")
         self._key_pressed = True
@@ -89,6 +107,7 @@ class VoiceClipApp(rumps.App):
         log.info("Hotkey released — stop recording")
         self._key_pressed = False
         self._transcribing = True
+        self._transcribe_started_at = time.monotonic()
         self._set_status("Transcribing...")
         self.title = "\u23f3"  # ⏳
         self.overlay.hide()
@@ -102,7 +121,7 @@ class VoiceClipApp(rumps.App):
             return
 
         threading.Thread(
-            target=self._do_transcribe, args=(wav_bytes,), daemon=True
+            target=self._safe_transcribe, args=(wav_bytes,), daemon=True
         ).start()
 
     def _on_audio_level(self, level: float):
@@ -132,7 +151,28 @@ class VoiceClipApp(rumps.App):
             self._set_status("No speech detected")
             self.title = "\U0001f399"  # 🎙
 
-        self._transcribing = False
+    def _safe_transcribe(self, wav_bytes: bytes):
+        """Thread entry point that GUARANTEES `_transcribing` is cleared.
+
+        `_do_transcribe` runs on this daemon thread and touches AppKit/rumps
+        (self.title, _set_status, _notify) off the main thread — any of which can
+        raise. If the flag stayed True after such a raise, `_on_hotkey_press` would
+        hit `if self._transcribing: return` and silently ignore every future press,
+        leaving the app dead-while-running with no log of why (issue #170). The
+        `finally` here is the single guarantee that one bad transcription cannot
+        permanently wedge dictation.
+        """
+        try:
+            self._do_transcribe(wav_bytes)
+        except Exception as e:
+            log.error(f"_do_transcribe crashed: {e}", exc_info=True)
+            _log(f"_do_transcribe crashed: {e}")
+            try:
+                self.title = "\U0001f399"  # 🎙
+            except Exception:
+                pass
+        finally:
+            self._transcribing = False
 
     def _retry_failed(self, sender):
         """Retry all failed transcriptions."""
