@@ -83,3 +83,163 @@ class TestTranscribeStuckTimeout:
         # Call the real wrapper bound to our fake — no rumps app instance needed.
         main.VoiceClipApp._safe_transcribe(app, b"\x00\x00")
         assert app._transcribing is False
+
+
+import threading
+import time
+
+
+def _make_app(**state):
+    """Build a bare VoiceClipApp instance (no __init__) with the given attrs."""
+    import main
+
+    app = main.VoiceClipApp.__new__(main.VoiceClipApp)
+    for k, v in state.items():
+        setattr(app, k, v)
+    return app
+
+
+def _live_thread():
+    """A thread that stays alive (blocked on an Event) for the test's duration."""
+    stop = threading.Event()
+    t = threading.Thread(target=stop.wait, daemon=True)
+    t.start()
+    return t, stop
+
+
+def _dead_thread():
+    """A thread that has already finished (is_alive() is False)."""
+    t = threading.Thread(target=lambda: None)
+    t.start()
+    t.join()
+    assert not t.is_alive()
+    return t
+
+
+class TestWedgedTranscriberRecovery:
+    """Issue #187 / jarvis-system #6 — a transcription wedged inside the native
+    mlx_whisper/Metal call must trigger a process re-exec, not just a gate reset."""
+
+    def test_busy_when_not_transcribing(self):
+        import main
+
+        app = _make_app(_transcribing=False, _transcribe_started_at=0.0,
+                        _transcribe_thread=None)
+        assert main.VoiceClipApp._stuck_recovery_action(app) == "busy"
+
+    def test_busy_within_timeout(self):
+        """A live worker only 1s in is legitimately working — leave it alone."""
+        import main
+
+        t, stop = _live_thread()
+        try:
+            app = _make_app(_transcribing=True,
+                            _transcribe_started_at=time.monotonic() - 1.0,
+                            _transcribe_thread=t)
+            assert main.VoiceClipApp._stuck_recovery_action(app) == "busy"
+        finally:
+            stop.set()
+
+    def test_reexec_when_wedged_thread_still_alive(self):
+        """Past the timeout AND the worker is still alive = native wedge → re-exec."""
+        import main
+
+        t, stop = _live_thread()
+        try:
+            app = _make_app(_transcribing=True,
+                            _transcribe_started_at=time.monotonic() - 999,
+                            _transcribe_thread=t)
+            assert main.VoiceClipApp._stuck_recovery_action(app) == "reexec"
+        finally:
+            stop.set()
+
+    def test_reset_when_gate_leaked_thread_dead(self):
+        """Past the timeout but the worker is gone = leaked gate → cheap reset."""
+        import main
+
+        app = _make_app(_transcribing=True,
+                        _transcribe_started_at=time.monotonic() - 999,
+                        _transcribe_thread=_dead_thread())
+        assert main.VoiceClipApp._stuck_recovery_action(app) == "reset"
+
+    def test_press_reexecs_on_live_wedge(self):
+        """`_on_hotkey_press` must re-exec (not start a new recording) when the
+        in-flight transcription is wedged in native code."""
+        import main
+
+        t, stop = _live_thread()
+        try:
+            calls = []
+
+            def fake_reexec():
+                calls.append(True)
+                raise SystemExit  # os.execv never returns; mimic that here
+
+            app = _make_app(_transcribing=True,
+                            _transcribe_started_at=time.monotonic() - 999,
+                            _transcribe_thread=t, _key_pressed=False)
+            app._reexec = fake_reexec
+
+            with pytest.raises(SystemExit):
+                app._on_hotkey_press()
+            assert calls == [True]
+        finally:
+            stop.set()
+
+    def test_watchdog_reexecs_live_wedge(self, monkeypatch):
+        """The background watchdog must re-exec a live wedge with no user keypress."""
+        import main
+
+        monkeypatch.setattr(main, "TRANSCRIBE_WATCHDOG_INTERVAL", 0.02)
+        t, stop = _live_thread()
+        try:
+            fired = threading.Event()
+
+            def fake_reexec():
+                fired.set()
+                raise SystemExit  # breaks the while-True loop like execv would
+
+            app = _make_app(_transcribing=True,
+                            _transcribe_started_at=time.monotonic() - 999,
+                            _transcribe_thread=t)
+            app._reexec = fake_reexec
+
+            runner = threading.Thread(
+                target=lambda: _swallow(app._transcribe_watchdog), daemon=True
+            )
+            runner.start()
+            assert fired.wait(timeout=2.0), "watchdog never re-execd a live wedge"
+        finally:
+            stop.set()
+
+    def test_watchdog_resets_leaked_gate_without_reexec(self, monkeypatch):
+        """A leaked gate (dead worker) must be reset, NOT re-exec'd."""
+        import main
+
+        monkeypatch.setattr(main, "TRANSCRIBE_WATCHDOG_INTERVAL", 0.02)
+
+        def boom():
+            raise AssertionError("must not re-exec a leaked gate")
+
+        app = _make_app(_transcribing=True,
+                        _transcribe_started_at=time.monotonic() - 999,
+                        _transcribe_thread=_dead_thread())
+        app._reexec = boom
+
+        runner = threading.Thread(
+            target=lambda: _swallow(app._transcribe_watchdog), daemon=True
+        )
+        runner.start()
+        # Give the watchdog a few iterations to act.
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and app._transcribing:
+            time.sleep(0.02)
+        assert app._transcribing is False
+
+
+def _swallow(fn):
+    """Run a watchdog loop, swallowing the SystemExit a fake _reexec raises."""
+    try:
+        fn()
+    except SystemExit:
+        pass

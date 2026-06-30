@@ -5,6 +5,7 @@ All notable changes to VoiceClip are documented here.
 ## [Unreleased]
 
 ### Added
+- **Self-healing for a transcription wedged in native code (issue #187 / jarvis-system #6).** A hang *inside* `mlx_whisper.transcribe` (native Metal) never returns, leaving the worker thread alive — the #170 flag-reset couldn't recover it, so dictation stayed dead until a manual `kill`+restart (incident 2026-06-30). A new background `_transcribe_watchdog` now re-execs the process (`os.execv`) when a transcription is stuck past `TRANSCRIBE_STUCK_TIMEOUT` **and** its worker thread is still alive (a true native wedge); a merely leaked gate still gets the cheap flag reset. `execv` keeps the PID but discards all in-process state — the automatic equivalent of the manual restart. Self-relaunch via `execv` (not self-exit) because there is deliberately no LaunchAgent (it breaks the CGEventTap). The instance-lock fd is now `O_CLOEXEC` so the exec releases and re-acquires it cleanly. Witnessed by `tests/manual_reexec.py`; unit-locked in `tests/test_transcribe_wedge.py`.
 - `~/.voice-clip/proper_nouns.txt` — user-editable list piped into Whisper's `initial_prompt`. Fixes recurring misreads of names and jargon (e.g. "Dewald", "HashDirectors", "SumSub"). Auto-created with sensible defaults on first run. Edit and call `Transcriber.reload_proper_nouns()` to refresh without restart.
 
 ### Changed
