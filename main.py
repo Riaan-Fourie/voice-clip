@@ -28,9 +28,16 @@ PID_FILE = os.path.join(STATE_DIR, "voiceclip.pid")
 _instance_lock_fd = None
 
 # If a transcription has held the `_transcribing` gate longer than this, assume it
-# hung and let the next hotkey press force-recover (issue #170). small.en on this
-# Mac transcribes in well under a second; 30s is far beyond any real run.
+# hung. small.en on this Mac transcribes in well under a second; 30s is far beyond
+# any real run (incl. the first cold model load). Recovery depends on whether the
+# worker thread is still alive: a leaked gate just needs a reset (issue #170), but a
+# thread genuinely wedged inside the native mlx_whisper/Metal call needs a full
+# process re-exec — no in-process reset can unwedge the GPU (jarvis-system #6).
 TRANSCRIBE_STUCK_TIMEOUT = 30.0
+
+# How often the background watchdog checks for a wedged transcription. Kept short so
+# recovery is automatic within ~5s of crossing the timeout, with no user keypress.
+TRANSCRIBE_WATCHDOG_INTERVAL = 5.0
 
 os.makedirs(STATE_DIR, exist_ok=True)
 
@@ -59,6 +66,8 @@ class VoiceClipApp(rumps.App):
         self._key_pressed = False
         self._transcribing = False
         self._transcribe_started_at = 0.0  # monotonic ts; backstop for a hung transcribe
+        self._transcribe_thread = None  # the in-flight worker; lets the watchdog tell a
+        #                                 true native wedge (alive) from a leaked gate (dead)
 
         # Build menu
         self.menu = [
@@ -78,19 +87,33 @@ class VoiceClipApp(rumps.App):
         self._hotkey.start()
         log.info("Hotkey listener started")
 
+        # Background watchdog: re-exec the process if a transcription hangs inside the
+        # native mlx_whisper/Metal call (jarvis-system #6). The hotkey-press backstop
+        # only recovers on the *next* press; this recovers with no user interaction.
+        self._transcribe_watchdog_thread = threading.Thread(
+            target=self._transcribe_watchdog, daemon=True
+        )
+        self._transcribe_watchdog_thread.start()
+
     def _on_hotkey_press(self):
         """Right Command pressed — start recording."""
         if self._transcribing:
-            # Backstop for a transcription that hung (never returned, so the
-            # `_safe_transcribe` finally never ran). Without this a single hung
-            # mlx_whisper call would silently kill dictation forever (issue #170).
-            stuck_for = time.monotonic() - self._transcribe_started_at
-            if stuck_for > TRANSCRIBE_STUCK_TIMEOUT:
-                log.warning(f"_transcribing stuck {stuck_for:.0f}s — force-resetting")
-                _log(f"_transcribing stuck {stuck_for:.0f}s — force-resetting")
-                self._transcribing = False
-            else:
+            # A transcription is in flight. If it has hung past the timeout, recover
+            # before starting a new recording; otherwise it's legitimately busy.
+            action = self._stuck_recovery_action()
+            if action == "busy":
                 return
+            stuck_for = time.monotonic() - self._transcribe_started_at
+            if action == "reexec":
+                # Thread still alive past the timeout = wedged in the native
+                # mlx_whisper/Metal call. No reset can unwedge it (jarvis-system #6).
+                log.error(f"Transcription wedged {stuck_for:.0f}s (on press) — re-execing")
+                _log(f"Transcription wedged {stuck_for:.0f}s (on press) — re-execing")
+                self._reexec()  # never returns
+            else:  # "reset" — gate leaked but the worker already died (issue #170)
+                log.warning(f"_transcribing gate leaked {stuck_for:.0f}s — force-resetting")
+                _log(f"_transcribing gate leaked {stuck_for:.0f}s — force-resetting")
+                self._transcribing = False
         if self._key_pressed:
             return
         log.info("Hotkey pressed — start recording")
@@ -120,9 +143,12 @@ class VoiceClipApp(rumps.App):
             self._transcribing = False
             return
 
-        threading.Thread(
+        # Keep the handle so the watchdog can distinguish a true native wedge
+        # (thread still alive) from a merely leaked gate (thread already gone).
+        self._transcribe_thread = threading.Thread(
             target=self._safe_transcribe, args=(wav_bytes,), daemon=True
-        ).start()
+        )
+        self._transcribe_thread.start()
 
     def _on_audio_level(self, level: float):
         """Called from recorder with current audio RMS level."""
@@ -173,6 +199,77 @@ class VoiceClipApp(rumps.App):
                 pass
         finally:
             self._transcribing = False
+
+    def _stuck_recovery_action(self) -> str:
+        """Classify the in-flight transcription so press-path and watchdog agree.
+
+        Returns:
+            "busy"   — not stuck (no transcription, or still within the timeout).
+            "reset"  — gate held past the timeout but the worker thread is already
+                       gone: a cheap flag reset is enough (the leaked-gate case the
+                       #170 `finally` is meant to prevent, kept as belt-and-braces).
+            "reexec" — gate held past the timeout AND the worker thread is still
+                       alive: it's wedged inside the native mlx_whisper/Metal call,
+                       which nothing in-process can unwedge (jarvis-system #6). The
+                       process must be replaced.
+        """
+        if not self._transcribing:
+            return "busy"
+        if time.monotonic() - self._transcribe_started_at <= TRANSCRIBE_STUCK_TIMEOUT:
+            return "busy"
+        t = self._transcribe_thread
+        if t is not None and t.is_alive():
+            return "reexec"
+        return "reset"
+
+    def _transcribe_watchdog(self):
+        """Daemon loop: auto-recover a transcription wedged in native code.
+
+        The #170 `finally` + the hotkey-press backstop clear the gate when the
+        transcribe thread *raises*. But a hang *inside* `mlx_whisper.transcribe`
+        (native Metal) never returns, so the thread stays alive and no in-process
+        reset can unwedge the GPU — every later press logs PRESS/RELEASE with no
+        Transcribing line until a manual restart (jarvis-system #6, 2026-06-30).
+        This loop detects that case and re-execs, with no user keypress required.
+
+        It can run *because* a native Metal hang releases the GIL — confirmed by the
+        incident log still recording hotkey events while transcription was wedged.
+        """
+        while True:
+            time.sleep(TRANSCRIBE_WATCHDOG_INTERVAL)
+            try:
+                action = self._stuck_recovery_action()
+                if action == "busy":
+                    continue
+                stuck_for = time.monotonic() - self._transcribe_started_at
+                if action == "reexec":
+                    log.error(f"Transcription wedged {stuck_for:.0f}s — re-execing to recover")
+                    _log(f"Transcription wedged {stuck_for:.0f}s — re-execing to recover")
+                    self._reexec()  # never returns
+                else:  # "reset"
+                    log.warning(f"_transcribing gate leaked {stuck_for:.0f}s — resetting")
+                    _log(f"_transcribing gate leaked {stuck_for:.0f}s — resetting")
+                    self._transcribing = False
+            except Exception as e:
+                log.error(f"transcribe watchdog error: {e}", exc_info=True)
+
+    def _reexec(self):
+        """Replace this wedged process image with a fresh one — the automatic
+        equivalent of the manual kill+restart that has always been the only fix.
+
+        A hang in mlx_whisper's native Metal call can't be unwedged in-process:
+        Python can't kill the worker thread, clearing the gate just piles the next
+        recording behind the same stuck GPU queue, and a new Transcriber reuses
+        mlx_whisper's process-global model singleton. `os.execv` keeps the PID but
+        discards ALL in-process state, so the fresh image re-loads the model and
+        re-attaches the CGEventTap from clean. The instance-lock fd is O_CLOEXEC, so
+        exec releases the flock and the new image re-acquires it. There is
+        deliberately no LaunchAgent (it breaks the CGEventTap), so self-relaunch via
+        execv — not self-exit — is the only crash-free recovery path.
+        """
+        _log("re-exec: replacing process image to recover wedged transcription")
+        log.error("re-exec: replacing process image to recover wedged transcription")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
     def _retry_failed(self, sender):
         """Retry all failed transcriptions."""
@@ -257,7 +354,10 @@ def _check_single_instance():
     """Ensure only one VoiceClip instance is active using an advisory file lock."""
     global _instance_lock_fd
     os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)
-    _instance_lock_fd = os.open(PID_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+    # O_CLOEXEC so a watchdog re-exec (os.execv) releases this flock as the old
+    # image is torn down — letting the fresh image re-acquire it. Without it the
+    # re-exec'd process would see the lock still held and exit as a "duplicate".
+    _instance_lock_fd = os.open(PID_FILE, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
     try:
         fcntl.flock(_instance_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
