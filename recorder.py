@@ -35,15 +35,11 @@ class Recorder:
                 return
             self._frames = []
             self._recording = True
-            # Prefer MacBook Air built-in mic for better quality
+            # Use the macOS system default input device (System Settings > Sound > Input).
+            # Change your mic there — VoiceClip follows whatever you pick.
+            # Note: AirPods/Bluetooth use a low-quality 8kHz SCO codec that hurts
+            # transcription; prefer a wired/built-in mic for accuracy (see GOTCHAS.md).
             device = None
-            try:
-                for i, dev in enumerate(sd.query_devices()):
-                    if "MacBook" in dev["name"] and dev["max_input_channels"] > 0:
-                        device = i
-                        break
-            except Exception:
-                pass
 
             self._stream = sd.InputStream(
                 device=device,

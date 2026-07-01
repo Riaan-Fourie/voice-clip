@@ -71,7 +71,11 @@
 ### AirPods mic produces poor transcription
 - Bluetooth SCO/HFP codec is low quality (8kHz mono)
 - Whisper struggles with this audio quality
-- **Solution: Always prefer MacBook Air built-in mic (device lookup by name)**
+- **VoiceClip follows the macOS system default input** (`recorder.py` uses `device=None`).
+  Set your mic in System Settings > Sound > Input. For best transcription accuracy,
+  pick a wired/built-in mic there rather than AirPods/Bluetooth.
+- (History: previously hardcoded a name lookup for the MacBook Air mic, which
+  overrode the system default and forced the wrong mic — see #190.)
 
 ### VU meter sensitivity
 - int16 audio RMS for normal speech at MacBook mic distance: ~200-2000
