@@ -5,6 +5,7 @@ All notable changes to VoiceClip are documented here.
 ## [Unreleased]
 
 ### Fixed
+- **Transition masking is now OFF by default (Jarvis #266).** The volume fade fought the user's own volume changes mid-dictation (restore wrote back a stale saved level — music swung loud/soft). Fade and Auto-Pause remain in the Transition submenu as explicit opt-ins only.
 - **Stale PortAudio device table killed dictation silently after AirPods reconnect (Jarvis #265).** Bluetooth devices get a new CoreAudio ID on every reconnect, but PortAudio snapshots devices at init — so in a long-running process every `InputStream` open (including the system-default retry) failed with `-9986`, and the press path surfaced nothing: volume ducked, then… silence. Now: on open failure the recorder re-initializes PortAudio, re-resolves the preference, retries, then falls back to system default; and `main.py` wraps `recorder.start()` so any mic failure shows a ⚠️ status + macOS notification instead of a silent no-op (and can never raise into the CGEventTap callback).
 
 ### Added

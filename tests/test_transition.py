@@ -62,8 +62,10 @@ class TestDeviceNeedsMasking:
 
 
 class TestDefaultMode:
-    def test_default_is_fade(self):
-        assert DEFAULT_TRANSITION_MODE == MODE_FADE
+    def test_default_is_off(self):
+        """Masking is opt-in: fade restores a stale saved volume over the
+        user's manual changes mid-dictation (#266) — never on by default."""
+        assert DEFAULT_TRANSITION_MODE == MODE_OFF
 
 
 class TestFadeMode:

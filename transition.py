@@ -23,7 +23,8 @@ MODE_FADE = "fade"
 MODE_PAUSE = "pause"
 MODE_OFF = "off"
 TRANSITION_MODES = (MODE_FADE, MODE_PAUSE, MODE_OFF)
-DEFAULT_TRANSITION_MODE = MODE_FADE
+DEFAULT_TRANSITION_MODE = MODE_OFF  # opt-in only: the fade fought manual
+#                                     volume changes mid-dictation (#266)
 
 DUCK_VOLUME = 8  # output volume (0-100) while the codec flips
 FADE_UP_STEPS = 4
