@@ -58,13 +58,17 @@ def resolve_input_device(preference, devices=None):
 
 
 class Recorder:
-    def __init__(self, on_level=None, mic_preference=DEFAULT_MIC_PREFERENCE):
+    def __init__(self, on_level=None, mic_preference=DEFAULT_MIC_PREFERENCE, hooks=None):
         """
         on_level: optional callback(float) called with RMS level 0.0-1.0
                   on each audio block (for VU meter).
         mic_preference: one of MIC_PREFERENCES; resolved to a device at each
                   start() so plugging/unplugging AirPods between recordings
                   just works.
+        hooks: optional object with pre_open(device_name) / post_open() /
+                  pre_close() / post_close() — used by TransitionManager to
+                  mask the Bluetooth HFP flip around the stream lifecycle.
+                  All hook calls are best-effort and never break recording.
         """
         self._frames = []
         self._stream = None
@@ -72,7 +76,17 @@ class Recorder:
         self._on_level = on_level
         self._lock = threading.Lock()
         self.mic_preference = mic_preference
+        self.hooks = hooks
         self.last_device_name = None  # set on each start(); for status display
+
+    def _hook(self, name, *args):
+        fn = getattr(self.hooks, name, None) if self.hooks else None
+        if fn is None:
+            return
+        try:
+            fn(*args)
+        except Exception as e:
+            _log(f"{name} hook failed: {e}", tag="recorder")
 
     @property
     def is_recording(self):
@@ -90,8 +104,20 @@ class Recorder:
             except Exception as e:
                 _log(f"mic resolve failed ({e}) — using system default", tag="recorder")
                 device, name = None, "System Default"
+            if device is None:
+                # Name the ACTUAL default input — the transition hooks need to
+                # know if it's a Bluetooth device, and the status line reads
+                # better ("AirPods Pro 3" beats "System Default").
+                try:
+                    name = sd.query_devices(kind="input")["name"]
+                except Exception:
+                    pass
             self.last_device_name = name
             _log(f"recording via {name} (pref={self.mic_preference})", tag="recorder")
+
+            # Duck volume / pause music BEFORE the stream opens — opening the
+            # stream is what flips the Bluetooth link to HFP.
+            self._hook("pre_open", name)
 
             try:
                 self._stream = self._open_stream(device)
@@ -101,6 +127,7 @@ class Recorder:
                 # a recording is never lost to a stale device index.
                 if device is None:
                     self._recording = False
+                    self._hook("post_close")  # undo pre_open masking
                     raise
                 _log(f"open {name} failed ({e}) — retrying system default", tag="recorder")
                 self.last_device_name = "System Default"
@@ -108,8 +135,10 @@ class Recorder:
                     self._stream = self._open_stream(None)
                 except Exception:
                     self._recording = False
+                    self._hook("post_close")  # undo pre_open masking
                     raise
             self._stream.start()
+            self._hook("post_open")
 
     def _open_stream(self, device):
         return sd.InputStream(
@@ -127,9 +156,11 @@ class Recorder:
             if not self._recording:
                 return b""
             self._recording = False
+            self._hook("pre_close")  # duck for the HFP→A2DP flip-back
             self._stream.stop()
             self._stream.close()
             self._stream = None
+            self._hook("post_close")
             frames = self._frames
             self._frames = []
 

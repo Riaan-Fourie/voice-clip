@@ -29,6 +29,14 @@ from recorder import (
 from transcriber import Transcriber
 from overlay import RecordingOverlay
 from hotkey import HotkeyListener
+from transition import (
+    TransitionManager,
+    MODE_FADE,
+    MODE_PAUSE,
+    MODE_OFF,
+    TRANSITION_MODES,
+    DEFAULT_TRANSITION_MODE,
+)
 from utils import _log, STATE_DIR, LOG_PATH, load_settings, save_settings
 
 # Menu labels for the Microphone submenu, in display order.
@@ -36,6 +44,14 @@ MIC_MENU_LABELS = {
     MIC_AIRPODS: "AirPods",
     MIC_MACBOOK: "MacBook Mic",
     MIC_SYSTEM: "System Default",
+}
+
+# Menu labels for the Transition submenu (how to mask the Bluetooth HFP flip
+# when recording starts on AirPods), in display order.
+TRANSITION_MENU_LABELS = {
+    MODE_FADE: "Volume Fade",
+    MODE_PAUSE: "Auto-Pause Music",
+    MODE_OFF: "Off",
 }
 
 PID_FILE = os.path.join(STATE_DIR, "voiceclip.pid")
@@ -77,7 +93,15 @@ class VoiceClipApp(rumps.App):
         mic_pref = settings.get("mic_preference", DEFAULT_MIC_PREFERENCE)
         if mic_pref not in MIC_PREFERENCES:
             mic_pref = DEFAULT_MIC_PREFERENCE
-        self.recorder = Recorder(on_level=self._on_audio_level, mic_preference=mic_pref)
+        transition_mode = settings.get("transition_mode", DEFAULT_TRANSITION_MODE)
+        if transition_mode not in TRANSITION_MODES:
+            transition_mode = DEFAULT_TRANSITION_MODE
+        self.transition = TransitionManager(mode=transition_mode)
+        self.recorder = Recorder(
+            on_level=self._on_audio_level,
+            mic_preference=mic_pref,
+            hooks=self.transition,
+        )
         _log("init: creating transcriber")
         self.transcriber = Transcriber()
         _log("init: transcriber done")
@@ -96,10 +120,20 @@ class VoiceClipApp(rumps.App):
             item.state = 1 if pref == mic_pref else 0
             self._mic_items[pref] = item
             mic_menu.add(item)
+        self._transition_items = {}
+        transition_menu = rumps.MenuItem("Transition")
+        for mode in TRANSITION_MODES:
+            item = rumps.MenuItem(
+                TRANSITION_MENU_LABELS[mode], callback=self._on_transition_select
+            )
+            item.state = 1 if mode == transition_mode else 0
+            self._transition_items[mode] = item
+            transition_menu.add(item)
         self.menu = [
             rumps.MenuItem("Status: Ready", callback=None),
             None,  # separator
             mic_menu,
+            transition_menu,
             None,
             rumps.MenuItem("Retry Failed (0)", callback=self._retry_failed),
             None,
@@ -198,6 +232,22 @@ class VoiceClipApp(rumps.App):
         save_settings(settings)
         log.info(f"Mic preference set to {pref}")
         self._set_status(f"Mic: {MIC_MENU_LABELS[pref]}")
+        threading.Timer(3.0, self._reset_status).start()
+
+    def _on_transition_select(self, sender):
+        """Transition submenu click — switch HFP-flip masking mode, persist."""
+        mode = next(
+            (m for m, item in self._transition_items.items() if item is sender),
+            DEFAULT_TRANSITION_MODE,
+        )
+        self.transition.mode = mode
+        for m, item in self._transition_items.items():
+            item.state = 1 if m == mode else 0
+        settings = load_settings()
+        settings["transition_mode"] = mode
+        save_settings(settings)
+        log.info(f"Transition mode set to {mode}")
+        self._set_status(f"Transition: {TRANSITION_MENU_LABELS[mode]}")
         threading.Timer(3.0, self._reset_status).start()
 
     def _do_transcribe(self, wav_bytes: bytes):

@@ -68,6 +68,15 @@
 
 ## Audio
 
+### AirPods mic flips the Bluetooth link to HFP (harsh audible clip)
+- Opening ANY AirPods mic stream renegotiates A2DP -> HFP: playback crunches to
+  call quality with a harsh clip, popping back ~1s after the mic closes
+- OS/Bluetooth-level; no app can remove it (issue #190 was reverted over this)
+- macOS 26 "studio-quality" AirPods recording does NOT reach plain CoreAudio
+  streams — probed 2026-07-17: nominal rate stays 24kHz wideband, not 48kHz
+- **Solution: Transition submenu (#264) masks the flip — Volume Fade (default)
+  or Auto-Pause Music; zero overhead on non-Bluetooth mics**
+
 ### AirPods mic produces poor transcription
 - Bluetooth SCO/HFP codec is low quality (8kHz mono)
 - Whisper struggles with this audio quality
