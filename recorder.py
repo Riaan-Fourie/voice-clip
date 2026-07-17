@@ -24,6 +24,24 @@ MIC_PREFERENCES = (MIC_AIRPODS, MIC_MACBOOK, MIC_SYSTEM)
 DEFAULT_MIC_PREFERENCE = MIC_AIRPODS
 
 
+def _reinit_portaudio():
+    """Rebuild PortAudio's device table.
+
+    PortAudio snapshots CoreAudio devices at init. Bluetooth devices get a NEW
+    CoreAudio ID on every reconnect, so in a long-running process the snapshot
+    goes stale and every InputStream open fails with paInternalError (-9986) —
+    even for the system default (Jarvis #265). Only a terminate/initialize
+    cycle rescans. Safe here because Recorder never holds an open stream when
+    it calls this.
+    """
+    try:
+        sd._terminate()
+        sd._initialize()
+        _log("PortAudio re-initialized (device table refreshed)", tag="recorder")
+    except Exception as e:
+        _log(f"PortAudio re-init failed: {e}", tag="recorder")
+
+
 def _find_input_device(devices, needle):
     """Return the index of the first input device whose name contains needle."""
     for i, dev in enumerate(devices):
@@ -122,21 +140,34 @@ class Recorder:
             try:
                 self._stream = self._open_stream(device)
             except Exception as e:
-                # Device vanished between resolve and open (AirPods disconnect
-                # race) or rejected our format — retry on the system default so
-                # a recording is never lost to a stale device index.
-                if device is None:
-                    self._recording = False
-                    self._hook("post_close")  # undo pre_open masking
-                    raise
-                _log(f"open {name} failed ({e}) — retrying system default", tag="recorder")
-                self.last_device_name = "System Default"
+                # First open failed — most likely the device table is stale
+                # (Bluetooth reconnect changed the CoreAudio ID, #265), or the
+                # device vanished between resolve and open. Refresh PortAudio,
+                # re-resolve, and retry; last resort is the system default.
+                _log(f"open {name} failed ({e}) — refreshing device table", tag="recorder")
+                _reinit_portaudio()
                 try:
-                    self._stream = self._open_stream(None)
-                except Exception:
-                    self._recording = False
-                    self._hook("post_close")  # undo pre_open masking
-                    raise
+                    device, name = resolve_input_device(self.mic_preference)
+                    if device is None:
+                        try:
+                            name = sd.query_devices(kind="input")["name"]
+                        except Exception:
+                            pass
+                    self.last_device_name = name
+                    self._stream = self._open_stream(device)
+                except Exception as e2:
+                    if device is None:
+                        self._recording = False
+                        self._hook("post_close")  # undo pre_open masking
+                        raise
+                    _log(f"open {name} failed after re-init ({e2}) — trying system default", tag="recorder")
+                    self.last_device_name = "System Default"
+                    try:
+                        self._stream = self._open_stream(None)
+                    except Exception:
+                        self._recording = False
+                        self._hook("post_close")  # undo pre_open masking
+                        raise
             self._stream.start()
             self._hook("post_open")
 

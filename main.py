@@ -183,7 +183,21 @@ class VoiceClipApp(rumps.App):
         self._set_status("Recording...")
         self.title = "\U0001f534"  # 🔴
         self.overlay.show()
-        self.recorder.start()
+        try:
+            self.recorder.start()
+        except Exception as e:
+            # A dead mic must NEVER be a silent no-op (#265: five recordings
+            # failed with zero user-visible signal) — and an exception must
+            # never escape into the CGEventTap callback.
+            log.error(f"recorder.start failed: {e}", exc_info=True)
+            _log(f"recorder.start failed: {e}")
+            self._key_pressed = False
+            self.overlay.hide()
+            self._set_status(f"Mic error: {str(e)[:40]}")
+            self.title = "⚠️"  # ⚠️
+            self._notify("Microphone Error", f"Could not open the mic: {str(e)[:80]}")
+            threading.Timer(3.0, self._reset_status).start()
+            return
         if self.recorder.last_device_name:
             self._set_status(f"Recording ({self.recorder.last_device_name})...")
 

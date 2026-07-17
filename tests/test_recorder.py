@@ -174,3 +174,83 @@ class TestMicPreference:
         devices = [{"name": "riaan's airpods pro", "max_input_channels": 1}]
         idx, _ = resolve_input_device(MIC_AIRPODS, devices)
         assert idx == 0
+
+
+class TestStaleDeviceRecovery:
+    """Recorder.start() must survive a stale PortAudio device table (#265)."""
+
+    class FakeStream:
+        def start(self): pass
+        def stop(self): pass
+        def close(self): pass
+
+    class Hooks:
+        def __init__(self):
+            self.calls = []
+        def pre_open(self, name): self.calls.append(("pre_open", name))
+        def post_open(self): self.calls.append(("post_open",))
+        def pre_close(self): self.calls.append(("pre_close",))
+        def post_close(self): self.calls.append(("post_close",))
+
+    def _recorder(self, monkeypatch, open_results, reinit_counter):
+        """open_results: list of Exception (to raise) or 'ok' per open attempt."""
+        import recorder as rec_mod
+        from recorder import Recorder
+
+        monkeypatch.setattr(rec_mod, "resolve_input_device", lambda pref, devices=None: (7, "AirPods Pro 3"))
+        monkeypatch.setattr(rec_mod, "_reinit_portaudio", lambda: reinit_counter.append(1))
+        hooks = self.Hooks()
+        r = Recorder(mic_preference="airpods", hooks=hooks)
+        attempts = []
+
+        def fake_open(device):
+            result = open_results[len(attempts)]
+            attempts.append(device)
+            if isinstance(result, Exception):
+                raise result
+            return self.FakeStream()
+
+        r._open_stream = fake_open
+        return r, hooks, attempts
+
+    def test_reinit_and_retry_recovers(self, monkeypatch):
+        reinits = []
+        r, hooks, attempts = self._recorder(
+            monkeypatch, [OSError("PaErrorCode -9986"), "ok"], reinits
+        )
+        r.start()
+        assert r.is_recording
+        assert len(reinits) == 1
+        assert attempts == [7, 7]  # resolved device retried after re-init
+        assert ("post_open",) in hooks.calls
+
+    def test_no_reinit_when_first_open_works(self, monkeypatch):
+        reinits = []
+        r, hooks, attempts = self._recorder(monkeypatch, ["ok"], reinits)
+        r.start()
+        assert r.is_recording
+        assert reinits == []
+
+    def test_falls_back_to_system_default(self, monkeypatch):
+        reinits = []
+        r, hooks, attempts = self._recorder(
+            monkeypatch,
+            [OSError("stale"), OSError("still stale"), "ok"],
+            reinits,
+        )
+        r.start()
+        assert r.is_recording
+        assert attempts == [7, 7, None]
+        assert r.last_device_name == "System Default"
+
+    def test_total_failure_raises_and_unmasks(self, monkeypatch):
+        reinits = []
+        r, hooks, attempts = self._recorder(
+            monkeypatch,
+            [OSError("a"), OSError("b"), OSError("c")],
+            reinits,
+        )
+        with pytest.raises(OSError):
+            r.start()
+        assert not r.is_recording
+        assert ("post_close",) in hooks.calls  # pre_open masking undone
