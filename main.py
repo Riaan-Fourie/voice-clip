@@ -18,11 +18,25 @@ import sys
 
 import rumps
 
-from recorder import Recorder
+from recorder import (
+    Recorder,
+    MIC_AIRPODS,
+    MIC_MACBOOK,
+    MIC_SYSTEM,
+    MIC_PREFERENCES,
+    DEFAULT_MIC_PREFERENCE,
+)
 from transcriber import Transcriber
 from overlay import RecordingOverlay
 from hotkey import HotkeyListener
-from utils import _log, STATE_DIR, LOG_PATH
+from utils import _log, STATE_DIR, LOG_PATH, load_settings, save_settings
+
+# Menu labels for the Microphone submenu, in display order.
+MIC_MENU_LABELS = {
+    MIC_AIRPODS: "AirPods",
+    MIC_MACBOOK: "MacBook Mic",
+    MIC_SYSTEM: "System Default",
+}
 
 PID_FILE = os.path.join(STATE_DIR, "voiceclip.pid")
 _instance_lock_fd = None
@@ -59,7 +73,11 @@ class VoiceClipApp(rumps.App):
         _log("init: creating overlay")
         self.overlay = RecordingOverlay()
         _log("init: creating recorder")
-        self.recorder = Recorder(on_level=self._on_audio_level)
+        settings = load_settings()
+        mic_pref = settings.get("mic_preference", DEFAULT_MIC_PREFERENCE)
+        if mic_pref not in MIC_PREFERENCES:
+            mic_pref = DEFAULT_MIC_PREFERENCE
+        self.recorder = Recorder(on_level=self._on_audio_level, mic_preference=mic_pref)
         _log("init: creating transcriber")
         self.transcriber = Transcriber()
         _log("init: transcriber done")
@@ -69,10 +87,20 @@ class VoiceClipApp(rumps.App):
         self._transcribe_thread = None  # the in-flight worker; lets the watchdog tell a
         #                                 true native wedge (alive) from a leaked gate (dead)
 
-        # Build menu
+        # Build menu — Microphone submenu holds one check-marked item per
+        # preference; picking one persists to ~/.voice-clip/settings.json.
+        self._mic_items = {}
+        mic_menu = rumps.MenuItem("Microphone")
+        for pref in MIC_PREFERENCES:
+            item = rumps.MenuItem(MIC_MENU_LABELS[pref], callback=self._on_mic_select)
+            item.state = 1 if pref == mic_pref else 0
+            self._mic_items[pref] = item
+            mic_menu.add(item)
         self.menu = [
             rumps.MenuItem("Status: Ready", callback=None),
             None,  # separator
+            mic_menu,
+            None,
             rumps.MenuItem("Retry Failed (0)", callback=self._retry_failed),
             None,
         ]
@@ -122,6 +150,8 @@ class VoiceClipApp(rumps.App):
         self.title = "\U0001f534"  # 🔴
         self.overlay.show()
         self.recorder.start()
+        if self.recorder.last_device_name:
+            self._set_status(f"Recording ({self.recorder.last_device_name})...")
 
     def _on_hotkey_release(self):
         """Right Command released — stop recording and transcribe."""
@@ -153,6 +183,22 @@ class VoiceClipApp(rumps.App):
     def _on_audio_level(self, level: float):
         """Called from recorder with current audio RMS level."""
         self.overlay.set_level(level)
+
+    def _on_mic_select(self, sender):
+        """Microphone submenu click — switch preference and persist it."""
+        pref = next(
+            (p for p, item in self._mic_items.items() if item is sender),
+            DEFAULT_MIC_PREFERENCE,
+        )
+        self.recorder.mic_preference = pref
+        for p, item in self._mic_items.items():
+            item.state = 1 if p == pref else 0
+        settings = load_settings()
+        settings["mic_preference"] = pref
+        save_settings(settings)
+        log.info(f"Mic preference set to {pref}")
+        self._set_status(f"Mic: {MIC_MENU_LABELS[pref]}")
+        threading.Timer(3.0, self._reset_status).start()
 
     def _do_transcribe(self, wav_bytes: bytes):
         """Run transcription and copy result to clipboard."""

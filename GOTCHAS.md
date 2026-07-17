@@ -71,7 +71,11 @@
 ### AirPods mic produces poor transcription
 - Bluetooth SCO/HFP codec is low quality (8kHz mono)
 - Whisper struggles with this audio quality
-- **Solution: Always prefer MacBook Air built-in mic (device lookup by name)**
+- Originally solved by hard-preferring the MacBook built-in mic
+- **Superseded (Jarvis #263): Riaan accepts the trade-off for convenience — AirPods
+  is now the default, with a Microphone submenu (persisted to
+  `~/.voice-clip/settings.json`) to switch back to MacBook Mic / System Default
+  in one click. If transcription quality drops noticeably, that toggle is the fix.**
 
 ### VU meter sensitivity
 - int16 audio RMS for normal speech at MacBook mic distance: ~200-2000

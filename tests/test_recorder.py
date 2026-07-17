@@ -116,3 +116,61 @@ class TestRmsCalculation:
         quiet = np.full((BLOCKSIZE, 1), 100, dtype="int16")
         loud = np.full((BLOCKSIZE, 1), 1000, dtype="int16")
         assert self.compute_level(quiet) < self.compute_level(loud)
+
+
+class TestMicPreference:
+    """Test mic preference → device resolution (pure logic, no hardware)."""
+
+    DEVICES = [
+        {"name": "Riaan's AirPods Pro", "max_input_channels": 1},
+        {"name": "MacBook Air Microphone", "max_input_channels": 1},
+        {"name": "MacBook Air Speakers", "max_input_channels": 0},
+        {"name": "BlackHole 2ch", "max_input_channels": 2},
+    ]
+
+    def test_default_preference_is_airpods(self):
+        from recorder import DEFAULT_MIC_PREFERENCE, MIC_AIRPODS
+        assert DEFAULT_MIC_PREFERENCE == MIC_AIRPODS
+
+    def test_airpods_selected_when_connected(self):
+        from recorder import resolve_input_device, MIC_AIRPODS
+        idx, name = resolve_input_device(MIC_AIRPODS, self.DEVICES)
+        assert idx == 0
+        assert "AirPods" in name
+
+    def test_airpods_falls_back_to_macbook(self):
+        from recorder import resolve_input_device, MIC_AIRPODS
+        devices = [d for d in self.DEVICES if "AirPods" not in d["name"]]
+        idx, name = resolve_input_device(MIC_AIRPODS, devices)
+        assert "MacBook Air Microphone" == devices[idx]["name"]
+
+    def test_airpods_falls_back_to_system_default(self):
+        from recorder import resolve_input_device, MIC_AIRPODS
+        devices = [{"name": "BlackHole 2ch", "max_input_channels": 2}]
+        idx, name = resolve_input_device(MIC_AIRPODS, devices)
+        assert idx is None
+        assert name == "System Default"
+
+    def test_macbook_preference_skips_airpods(self):
+        from recorder import resolve_input_device, MIC_MACBOOK
+        idx, name = resolve_input_device(MIC_MACBOOK, self.DEVICES)
+        assert idx == 1
+
+    def test_output_only_device_never_selected(self):
+        """Speakers (0 input channels) must never match, even by name."""
+        from recorder import resolve_input_device, MIC_MACBOOK
+        devices = [{"name": "MacBook Air Speakers", "max_input_channels": 0}]
+        idx, name = resolve_input_device(MIC_MACBOOK, devices)
+        assert idx is None
+
+    def test_system_preference_uses_default(self):
+        from recorder import resolve_input_device, MIC_SYSTEM
+        idx, name = resolve_input_device(MIC_SYSTEM, self.DEVICES)
+        assert idx is None
+        assert name == "System Default"
+
+    def test_case_insensitive_match(self):
+        from recorder import resolve_input_device, MIC_AIRPODS
+        devices = [{"name": "riaan's airpods pro", "max_input_channels": 1}]
+        idx, _ = resolve_input_device(MIC_AIRPODS, devices)
+        assert idx == 0
