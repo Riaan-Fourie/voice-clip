@@ -50,6 +50,14 @@ def _find_input_device(devices, needle):
     return None
 
 
+# The device name each preference actually asks for. A resolution that does
+# not land on this needle is a fallback, not a match — see resolve_input_device.
+_PREFERENCE_NEEDLE = {
+    MIC_AIRPODS: "AirPods",
+    MIC_MACBOOK: "MacBook",
+}
+
+
 def resolve_input_device(preference, devices=None):
     """Map a mic preference to a sounddevice input index.
 
@@ -73,6 +81,39 @@ def resolve_input_device(preference, devices=None):
             return idx, devices[idx]["name"]
 
     return None, "System Default"
+
+
+def resolve_with_refresh(preference):
+    """resolve_input_device, but retried once against a rebuilt device table
+    if the preferred device wasn't found.
+
+    PortAudio snapshots CoreAudio at init and Bluetooth devices get a new ID
+    on every reconnect, so connecting AirPods to an already-running daemon
+    leaves them invisible — resolution quietly falls back to the MacBook mic
+    and STAYS there until restart (#270). The #265 refresh can't catch this:
+    it only fires when opening the stream raises, and the fallback opens just
+    fine. So detect the fallback itself and refresh before opening.
+
+    Costs a terminate/initialize only on the fallback path; a preference that
+    resolves first try (or system default, which asks for nothing) is
+    untouched.
+    """
+    device, name = resolve_input_device(preference)
+    needle = _PREFERENCE_NEEDLE.get(preference)
+    if needle is None or needle.lower() in name.lower():
+        return device, name
+
+    _log(
+        f"{preference} wanted but resolved to {name} — refreshing device table",
+        tag="recorder",
+    )
+    _reinit_portaudio()
+    device, name = resolve_input_device(preference)
+    if needle.lower() not in name.lower():
+        # Genuinely not connected — the fallback is correct, just say so once
+        # so a silent downgrade is never invisible.
+        _log(f"{preference} not present; using {name}", tag="recorder")
+    return device, name
 
 
 class Recorder:
@@ -118,7 +159,7 @@ class Recorder:
             self._frames = []
             self._recording = True
             try:
-                device, name = resolve_input_device(self.mic_preference)
+                device, name = resolve_with_refresh(self.mic_preference)
             except Exception as e:
                 _log(f"mic resolve failed ({e}) — using system default", tag="recorder")
                 device, name = None, "System Default"
