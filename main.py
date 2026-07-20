@@ -31,6 +31,7 @@ from overlay import RecordingOverlay
 from hotkey import HotkeyListener
 from transition import (
     TransitionManager,
+    MODE_HOLD,
     MODE_FADE,
     MODE_PAUSE,
     MODE_OFF,
@@ -49,6 +50,7 @@ MIC_MENU_LABELS = {
 # Menu labels for the Transition submenu (how to mask the Bluetooth HFP flip
 # when recording starts on AirPods), in display order.
 TRANSITION_MENU_LABELS = {
+    MODE_HOLD: "Hold Volume",
     MODE_FADE: "Volume Fade",
     MODE_PAUSE: "Auto-Pause Music",
     MODE_OFF: "Off",
