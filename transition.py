@@ -3,8 +3,15 @@
 Opening a Bluetooth mic (AirPods) renegotiates the whole link down to the
 hands-free profile — playback audibly crunches with a harsh clip, then pops
 back ~1s after the mic closes. The flip is OS-level and cannot be removed
-(Jarvis #190 was reverted over it); this module only softens it, two ways:
+(Jarvis #190 was reverted over it); this module only softens it, three ways:
 
+  hold  — keep output volume where it was. macOS stores volume PER Bluetooth
+          profile, and HFP's remembered level is usually higher than A2DP's,
+          so the flip alone makes playback jump (38 → 50 on AirPods Pro 3,
+          measured #269). Writing the A2DP level back once HFP is live fixes
+          it, and the write PERSISTS to the HFP profile — so after the first
+          recording the flip is silent on its own, and any later drift
+          self-heals. One volume call per recording, none during or after it.
   fade  — duck output volume just before the mic opens (the flip lands in
           near-silence), ramp back up after; duck again around close.
   pause — pause Spotify/Music if playing, resume after the link flips back:
@@ -19,12 +26,15 @@ import threading
 
 from utils import _log
 
+MODE_HOLD = "hold"
 MODE_FADE = "fade"
 MODE_PAUSE = "pause"
 MODE_OFF = "off"
-TRANSITION_MODES = (MODE_FADE, MODE_PAUSE, MODE_OFF)
-DEFAULT_TRANSITION_MODE = MODE_OFF  # opt-in only: the fade fought manual
-#                                     volume changes mid-dictation (#266)
+TRANSITION_MODES = (MODE_HOLD, MODE_FADE, MODE_PAUSE, MODE_OFF)
+# hold is safe as a default where fade was not: it never ducks, and it only
+# writes at open, so it can't fight a manual volume change mid-dictation
+# (#266) the way the fade's ramp-up and delayed restore did.
+DEFAULT_TRANSITION_MODE = MODE_HOLD
 
 DUCK_VOLUME = 8  # output volume (0-100) while the codec flips
 FADE_UP_STEPS = 4
@@ -93,6 +103,14 @@ def _set_output_volume(v):
     _osascript(f"set volume output volume {int(v)}")
 
 
+def _get_output_volume():
+    """Current output volume as an int, or None if it couldn't be read."""
+    try:
+        return int(_osascript("output volume of (get volume settings)"))
+    except (TypeError, ValueError):
+        return None
+
+
 def device_needs_masking(device_name) -> bool:
     """True when recording from this device will flip the Bluetooth link."""
     if not device_name:
@@ -119,6 +137,10 @@ class TransitionManager:
         # without carrying its payload forward, the pre-recording volume (or
         # the paused players) would be lost and the duck would stick.
         self._carried = None
+        # hold mode reads the pre-flip volume off-thread (an osascript round
+        # trip is ~124ms and pre_open sits on the hotkey path); post_open
+        # waits on this instead of blocking the press. See pre_open.
+        self._read_done = threading.Event()
         self._lock = threading.Lock()
 
     def pre_open(self, device_name):
@@ -142,7 +164,31 @@ class TransitionManager:
                         _osascript(f'tell application "{p}" to play')
                 return
 
-            if self.mode == MODE_FADE:
+            if self.mode == MODE_HOLD:
+                # A mode switch away from fade/pause can leave a cancelled
+                # restore still owing; settle it before taking our reading, or
+                # we'd save a ducked volume as the level to hold.
+                if carried and carried[0] == "fade":
+                    _set_output_volume(carried[1])
+                elif carried and carried[0] == "pause":
+                    for p in carried[1]:
+                        _osascript(f'tell application "{p}" to play')
+                # Read off-thread: blocking ~124ms here would delay the stream
+                # open and clip the first word. The read beats the A2DP→HFP
+                # flip comfortably (measured: read 122ms vs stream live 248ms),
+                # so it still captures the pre-flip level; post_open waits on
+                # _read_done and simply skips the correction if it didn't.
+                self._saved_volume = None
+                self._read_done.clear()
+
+                def _read():
+                    vol = _get_output_volume()
+                    self._saved_volume = vol
+                    self._read_done.set()
+                    _log(f"hold: A2DP volume is {vol}", tag="transition")
+
+                threading.Thread(target=_read, daemon=True).start()
+            elif self.mode == MODE_FADE:
                 if carried and carried[0] == "fade":
                     # Volume is still ducked (or mid-ramp) from the previous
                     # recording — re-duck and keep the ORIGINAL saved volume.
@@ -165,8 +211,31 @@ class TransitionManager:
                     _log(f"pause: holding {paused}", tag="transition")
 
     def post_open(self):
-        """Called right after the stream is live — ramp volume back up."""
-        if not self._active or self.mode != MODE_FADE:
+        """Called right after the stream is live — the link is on HFP now."""
+        if not self._active:
+            return
+
+        if self.mode == MODE_HOLD:
+            def _hold():
+                # The pre-flip read was fired off-thread in pre_open; without
+                # it there is no target level, so leave the volume alone
+                # rather than guess.
+                if not self._read_done.wait(0.5):
+                    _log("hold: volume read too slow — left alone", tag="transition")
+                    return
+                saved = self._saved_volume
+                self._saved_volume = None
+                if saved is None:
+                    return
+                if _get_output_volume() == saved:
+                    return  # profiles already agree — nothing to correct
+                _set_output_volume(saved)
+                _log(f"hold: corrected HFP volume to {saved}", tag="transition")
+
+            threading.Thread(target=_hold, daemon=True).start()
+            return
+
+        if self.mode != MODE_FADE:
             return
         saved = self._saved_volume
         if saved is None or saved <= DUCK_VOLUME:

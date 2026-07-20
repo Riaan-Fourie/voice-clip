@@ -74,8 +74,27 @@
 - OS/Bluetooth-level; no app can remove it (issue #190 was reverted over this)
 - macOS 26 "studio-quality" AirPods recording does NOT reach plain CoreAudio
   streams — probed 2026-07-17: nominal rate stays 24kHz wideband, not 48kHz
-- **Solution: Transition submenu (#264) masks the flip — Volume Fade (default)
-  or Auto-Pause Music; zero overhead on non-Bluetooth mics**
+- **Solution: Transition submenu (#264) masks the flip — Hold Volume (default,
+  #269), Volume Fade or Auto-Pause Music; zero overhead on non-Bluetooth mics**
+
+### The HFP flip can make playback JUMP IN VOLUME (#269)
+- macOS remembers an output volume per Bluetooth profile. When A2DP and HFP
+  have drifted apart, opening the mic swaps in HFP's level with no warning —
+  measured 2026-07-20 on AirPods Pro 3: A2DP 38 -> HFP **50** -> back to 38
+- Nothing in VoiceClip caused it; it reproduced with `transition_mode: off`
+- **The two levels are NOT independent once you write one.** Setting the
+  volume while HFP is live sets BOTH profiles, and they then track each other
+  under any subsequent write. A single correction therefore fixes the
+  divergence permanently — which is also why the bug is hard to re-create
+  once healed (probing it destroys the very state you are trying to test)
+- **Solution: Hold Volume mode** — read the level just before the flip, write
+  it back once HFP is live. Cheap and self-healing, and a no-op when the
+  profiles already agree
+- The pre-flip read is done OFF-THREAD: `pre_open` runs on the hotkey press
+  path and an osascript round trip is ~124ms, enough to clip the first word.
+  Measured margin: read completes at ~122ms, stream goes live at ~248ms, so
+  the async read still captures the pre-flip level. If it does not land in
+  time the correction is skipped rather than guessed
 
 ### AirPods mic produces poor transcription
 - Bluetooth SCO/HFP codec is low quality (8kHz mono)

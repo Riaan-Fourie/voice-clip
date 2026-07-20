@@ -9,6 +9,7 @@ import transition
 from transition import (
     TransitionManager,
     device_needs_masking,
+    MODE_HOLD,
     MODE_FADE,
     MODE_PAUSE,
     MODE_OFF,
@@ -62,10 +63,15 @@ class TestDeviceNeedsMasking:
 
 
 class TestDefaultMode:
-    def test_default_is_off(self):
-        """Masking is opt-in: fade restores a stale saved volume over the
-        user's manual changes mid-dictation (#266) — never on by default."""
-        assert DEFAULT_TRANSITION_MODE == MODE_OFF
+    def test_default_is_hold(self):
+        """hold is on by default (#269): the HFP flip jumps output volume on
+        its own, so 'off' is not neutral — it just lets the spike through.
+        Unlike fade (#266) it never ducks and only writes at open, so it
+        cannot stomp a manual volume change mid-dictation."""
+        assert DEFAULT_TRANSITION_MODE == MODE_HOLD
+
+    def test_fade_is_not_the_default(self):
+        assert DEFAULT_TRANSITION_MODE != MODE_FADE
 
 
 class TestFadeMode:
@@ -189,3 +195,89 @@ class TestRecorderHookSafety:
 
         r = Recorder()
         r._hook("post_close")  # must not raise
+
+
+class TestHoldMode:
+    """#269 — hold the A2DP volume across the HFP flip instead of ducking."""
+
+    def test_writes_saved_volume_back_after_open(self, fake_osa, monkeypatch):
+        # A2DP reads 38; the flip pushes HFP to 50, so a correction is owed.
+        reads = iter(["38", "50"])
+
+        def _fake(script, timeout=2.0):
+            fake_osa["calls"].append(script)
+            if "output volume of" in script:
+                return next(reads)
+            return ""
+
+        monkeypatch.setattr(transition, "_osascript", _fake)
+        tm = TransitionManager(mode=MODE_HOLD)
+        tm.pre_open("AirPods Pro 3")
+        tm.post_open()
+        assert wait_for(
+            lambda: any("set volume output volume 38" in c for c in fake_osa["calls"])
+        ), fake_osa["calls"]
+
+    def test_no_write_when_hfp_already_matches(self, fake_osa, monkeypatch):
+        # Both reads return 38 — HFP already remembers it, so nothing to do.
+        def _fake(script, timeout=2.0):
+            fake_osa["calls"].append(script)
+            return "38" if "output volume of" in script else ""
+
+        monkeypatch.setattr(transition, "_osascript", _fake)
+        tm = TransitionManager(mode=MODE_HOLD)
+        tm.pre_open("AirPods Pro 3")
+        tm.post_open()
+        time.sleep(0.1)
+        assert not any("set volume output volume" in c for c in fake_osa["calls"])
+
+    def test_non_bluetooth_device_makes_no_volume_calls(self, fake_osa):
+        tm = TransitionManager(mode=MODE_HOLD)
+        tm.pre_open("MacBook Air Microphone")
+        tm.post_open()
+        time.sleep(0.1)
+        assert fake_osa["calls"] == []
+
+    def test_never_writes_on_close(self, fake_osa, monkeypatch):
+        """A manual volume change mid-dictation must survive (#266)."""
+        def _fake(script, timeout=2.0):
+            fake_osa["calls"].append(script)
+            return "38" if "output volume of" in script else ""
+
+        monkeypatch.setattr(transition, "_osascript", _fake)
+        tm = TransitionManager(mode=MODE_HOLD)
+        tm.pre_open("AirPods Pro 3")
+        tm.post_open()
+        time.sleep(0.1)
+        fake_osa["calls"].clear()
+        tm.pre_close()
+        tm.post_close()
+        time.sleep(0.1)
+        assert fake_osa["calls"] == []
+
+    def test_is_the_default_mode(self):
+        assert DEFAULT_TRANSITION_MODE == MODE_HOLD
+
+    def test_pre_open_does_not_block_the_hotkey_path(self, fake_osa, monkeypatch):
+        """pre_open sits on the hotkey press; a blocking osascript there
+        delays the stream open and clips the first word (#269)."""
+        def _slow(script, timeout=2.0):
+            fake_osa["calls"].append(script)
+            time.sleep(0.15)  # a real osascript round trip is ~124ms
+            return "38"
+
+        monkeypatch.setattr(transition, "_osascript", _slow)
+        tm = TransitionManager(mode=MODE_HOLD)
+        t = time.perf_counter()
+        tm.pre_open("AirPods Pro 3")
+        elapsed = time.perf_counter() - t
+        assert elapsed < 0.05, f"pre_open blocked for {elapsed*1000:.0f}ms"
+
+    def test_skips_correction_when_read_never_lands(self, fake_osa, monkeypatch):
+        """No pre-flip level = no target; leave the user's volume alone."""
+        monkeypatch.setattr(transition, "_get_output_volume", lambda: None)
+        tm = TransitionManager(mode=MODE_HOLD)
+        tm.pre_open("AirPods Pro 3")
+        tm.post_open()
+        time.sleep(0.15)
+        assert not any("set volume output volume" in c for c in fake_osa["calls"])
