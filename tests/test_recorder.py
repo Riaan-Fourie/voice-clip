@@ -7,6 +7,7 @@ import wave
 import numpy as np
 import pytest
 
+import recorder
 from recorder import SAMPLE_RATE, CHANNELS, DTYPE, BLOCKSIZE
 
 
@@ -254,3 +255,63 @@ class TestStaleDeviceRecovery:
             r.start()
         assert not r.is_recording
         assert ("post_close",) in hooks.calls  # pre_open masking undone
+
+
+class TestResolveWithRefresh:
+    """#270 — AirPods connected AFTER the daemon started are invisible until
+    PortAudio's device table is rebuilt, and the MacBook fallback opens fine
+    so nothing ever triggers the #265 refresh."""
+
+    STALE = [
+        {"name": "MacBook Air Microphone", "max_input_channels": 1},
+    ]
+    FRESH = [
+        {"name": "MacBook Air Microphone", "max_input_channels": 1},
+        {"name": "AirPods Pro 3", "max_input_channels": 1},
+    ]
+
+    def test_refreshes_and_finds_airpods_after_reconnect(self, monkeypatch):
+        tables = iter([self.STALE, self.FRESH])
+        reinits = []
+        monkeypatch.setattr(recorder.sd, "query_devices", lambda: next(tables))
+        monkeypatch.setattr(recorder, "_reinit_portaudio", lambda: reinits.append(1))
+
+        device, name = recorder.resolve_with_refresh(recorder.MIC_AIRPODS)
+        assert name == "AirPods Pro 3"
+        assert len(reinits) == 1
+
+    def test_no_reinit_when_airpods_resolve_first_try(self, monkeypatch):
+        reinits = []
+        monkeypatch.setattr(recorder.sd, "query_devices", lambda: self.FRESH)
+        monkeypatch.setattr(recorder, "_reinit_portaudio", lambda: reinits.append(1))
+
+        device, name = recorder.resolve_with_refresh(recorder.MIC_AIRPODS)
+        assert name == "AirPods Pro 3"
+        assert reinits == []  # happy path pays nothing
+
+    def test_genuinely_absent_airpods_still_fall_back(self, monkeypatch):
+        reinits = []
+        monkeypatch.setattr(recorder.sd, "query_devices", lambda: self.STALE)
+        monkeypatch.setattr(recorder, "_reinit_portaudio", lambda: reinits.append(1))
+
+        device, name = recorder.resolve_with_refresh(recorder.MIC_AIRPODS)
+        assert name == "MacBook Air Microphone"
+        assert len(reinits) == 1  # tried once, no retry storm
+
+    def test_system_preference_never_reinits(self, monkeypatch):
+        reinits = []
+        monkeypatch.setattr(recorder.sd, "query_devices", lambda: self.STALE)
+        monkeypatch.setattr(recorder, "_reinit_portaudio", lambda: reinits.append(1))
+
+        device, name = recorder.resolve_with_refresh(recorder.MIC_SYSTEM)
+        assert device is None
+        assert reinits == []  # system default asks for nothing, so never a fallback
+
+    def test_macbook_preference_resolves_without_reinit(self, monkeypatch):
+        reinits = []
+        monkeypatch.setattr(recorder.sd, "query_devices", lambda: self.STALE)
+        monkeypatch.setattr(recorder, "_reinit_portaudio", lambda: reinits.append(1))
+
+        device, name = recorder.resolve_with_refresh(recorder.MIC_MACBOOK)
+        assert name == "MacBook Air Microphone"
+        assert reinits == []
