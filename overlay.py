@@ -44,11 +44,16 @@ import Quartz
 
 ABOVE_ALL_LEVEL = Quartz.kCGScreenSaverWindowLevel + 100
 
-# Overlay geometry. The mascot is drawn centred at MASCOT_SIZE; the window is
-# larger so cheek bolts have room to reach out past the body before clipping.
+# Overlay geometry. The window now covers the WHOLE screen (transparent,
+# click-through) so the cheek lightning can grow to fill it the longer you speak.
+# The mascot itself stays this size, pinned near the bottom-centre.
 MASCOT_SIZE = 118
-WINDOW_WIDTH = 200
-WINDOW_HEIGHT = 200
+MASCOT_BOTTOM_MARGIN = 110   # mascot centre this far up from the screen bottom
+
+# Duration ramp: the bolts' reach grows from "just around the body" to "across the
+# whole screen" over this many seconds of a single continuous recording. The longer
+# you talk, the more the storm consumes the screen.
+FILL_SECONDS = 16.0
 
 _ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 _GIF_PATH = os.path.join(_ASSET_DIR, "mascot.gif")
@@ -122,6 +127,7 @@ class MascotView(NSView):
             return None
         self._level = 0.0          # target level from the recorder
         self._smooth = 0.0         # smoothed level actually rendered
+        self._elapsed = 0.0        # seconds since this recording started (drives fill)
         self._mascot = _load_mascot()
         self._idx = 0
         self._accum = 0.0
@@ -138,6 +144,7 @@ class MascotView(NSView):
         interval = 1.0 / 30.0
         # ease the rendered level toward the target so bolts swell/settle
         self._smooth += (self._level - self._smooth) * 0.35
+        self._elapsed += interval
         self._tick += 1
         if self._mascot is not None:
             _, delays, _, _ = self._mascot
@@ -156,9 +163,10 @@ class MascotView(NSView):
         NSBezierPath.fillRect_(self.bounds())
 
         b = self.bounds()
-        cx = b.size.width / 2.0
-        cy = b.size.height / 2.0
         m = MASCOT_SIZE
+        # mascot pinned near bottom-centre of the (full-screen) view
+        cx = b.size.width / 2.0
+        cy = MASCOT_BOTTOM_MARGIN + m / 2.0
         mrect = NSRect(NSPoint(cx - m / 2.0, cy - m / 2.0), NSSize(m, m))
 
         if self._mascot is None:
@@ -177,14 +185,17 @@ class MascotView(NSView):
             ay = mrect.origin.y + (1.0 - ny) * m
             anchors.append((ax, ay))
 
-        self._draw_lightning(anchors, cx, cy, m)
+        # reach: 0 → bolts just around the body, 1 → they can span the whole
+        # screen. Grows with how long this recording has been going.
+        reach = max(0.0, min(1.0, self._elapsed / FILL_SECONDS))
+        self._draw_lightning(anchors, cx, cy, m, reach, b.size.width, b.size.height)
 
         frames[idx].drawInRect_fromRect_operation_fraction_(
             mrect, NSRect(NSPoint(0, 0), frames[idx].size()),
             NSCompositingOperationSourceOver, 1.0,
         )
 
-    def _draw_lightning(self, anchors, cx, cy, span):
+    def _draw_lightning(self, anchors, cx, cy, span, reach, view_w, view_h):
         # intensity: a always-on idle shimmer + the smoothed mic level
         level = max(0.0, min(1.0, self._smooth))
         intensity = 0.10 + 0.90 * level
@@ -196,22 +207,30 @@ class MascotView(NSView):
         midc = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 0.92, 0.36, 0.95)
         core = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 1.0)
 
+        diag = math.hypot(view_w, view_h)
+        # how far bolts can shoot: from ~half the body up toward the full screen,
+        # scaled by both the duration reach and the current voice level.
+        reach_len = reach * diag * 0.8 * (0.35 + 0.65 * level)
+        # as reach grows the fan opens from a ~150° spray to a full 360° storm
+        spread_range = math.radians(150 + reach * 210)
+
         for (ax, ay) in anchors:
             ox, oy = ax - cx, ay - cy
             base_ang = math.atan2(oy, ox) if (ox or oy) else math.pi / 2.0
-            n = int(1 + intensity * 5)          # bolts per cheek
+            n = int(1 + intensity * 5 + reach * 9)   # more bolts as it fills
             for i in range(n):
-                spread = (i / max(1, n - 1) - 0.5) * math.radians(150)
+                spread = (i / max(1, n - 1) - 0.5) * spread_range
                 a = base_ang + spread + (rng.random() - 0.5) * 0.4
-                length = span * (0.14 + intensity * (0.24 + rng.random() * 0.26))
+                length = span * (0.14 + intensity * (0.24 + rng.random() * 0.26)) \
+                    + reach_len * (0.45 + 0.55 * rng.random())
                 x1 = ax + math.cos(a) * length
                 y1 = ay + math.sin(a) * length
-                pts = _jagged(ax, ay, x1, y1, span * 0.12 * intensity + 3, rng)
+                pts = _jagged(ax, ay, x1, y1, length * 0.14 + 3, rng)
                 p = _polyline_path(pts)
                 p.setLineJoinStyle_(1)   # round
                 p.setLineCapStyle_(1)
-                glow.set(); p.setLineWidth_(7 + intensity * 4); p.stroke()
-                midc.set(); p.setLineWidth_(3 + intensity * 2); p.stroke()
+                glow.set(); p.setLineWidth_(7 + intensity * 4 + reach * 4); p.stroke()
+                midc.set(); p.setLineWidth_(3 + intensity * 2 + reach * 2); p.stroke()
                 core.set(); p.setLineWidth_(1.5); p.stroke()
 
             # bright glint sitting on the cheek (the spark source)
@@ -261,11 +280,9 @@ class RecordingOverlay:
         if self._window is not None:
             return
         screen = NSScreen.mainScreen()
-        screen_frame = screen.frame()
-        x = (screen_frame.size.width - WINDOW_WIDTH) / 2
-        y = 90  # from bottom
-
-        frame = NSRect(NSPoint(x, y), NSSize(WINDOW_WIDTH, WINDOW_HEIGHT))
+        # Cover the WHOLE screen (transparent, click-through) so the lightning can
+        # grow to fill it. The mascot is drawn near the bottom-centre by the view.
+        frame = screen.frame()
         style = (NSWindowStyleMaskBorderless
                  | NSWindowStyleMaskNonactivatingPanel
                  | NSWindowStyleMaskUtilityWindow)
@@ -275,13 +292,13 @@ class RecordingOverlay:
         self._window.setLevel_(ABOVE_ALL_LEVEL)
         self._window.setOpaque_(False)
         self._window.setBackgroundColor_(NSColor.clearColor())
-        self._window.setIgnoresMouseEvents_(True)
+        self._window.setIgnoresMouseEvents_(True)   # click-through — never blocks the user
         self._window.setHidesOnDeactivate_(False)
         self._window.setFloatingPanel_(True)
         self._window.setCollectionBehavior_((1 << 0) | (1 << 8) | (1 << 4))
 
         self._view = MascotView.alloc().initWithFrame_(
-            NSRect(NSPoint(0, 0), NSSize(WINDOW_WIDTH, WINDOW_HEIGHT)))
+            NSRect(NSPoint(0, 0), frame.size))
         self._window.setContentView_(self._view)
 
     def show(self):
@@ -293,6 +310,7 @@ class RecordingOverlay:
             self._ensure_window()
             self._view._level = 0.0
             self._view._smooth = 0.0
+            self._view._elapsed = 0.0   # restart the fill ramp each recording
             self._window.setAlphaValue_(1.0)
             self._window.orderFrontRegardless()
             self._visible = True
