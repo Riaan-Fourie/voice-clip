@@ -20,6 +20,11 @@ HOTKEY_KEYCODE = 54
 # kCGEventFlagMaskCommand = 0x100000
 HOTKEY_FLAG = 0x100000
 
+# Right Shift key = keyCode 60; pressing it WITH Right Command forms the
+# hands-free lock toggle. kCGEventFlagMaskShift = 0x20000.
+LOCK_KEYCODE = 60
+LOCK_FLAG = 0x20000
+
 # Debounce: ignore press/release cycles shorter than this (seconds)
 MIN_HOLD_DURATION = 0.15
 # Cooldown: minimum gap between end of one recording and start of next (seconds)
@@ -40,9 +45,10 @@ def _log(msg):
 class HotkeyListener:
     """Listens for Right Command key press/release using CGEventTap on the main run loop."""
 
-    def __init__(self, on_press=None, on_release=None):
+    def __init__(self, on_press=None, on_release=None, on_toggle=None):
         self._on_press = on_press
         self._on_release = on_release
+        self._on_toggle = on_toggle
         self._key_down = False
         self._tap = None
         self._source = None
@@ -53,6 +59,10 @@ class HotkeyListener:
         self._recreate_count = 0
         self._press_time = 0.0
         self._last_release_time = 0.0
+        # Lock-toggle chord state (Right Shift + Right Command held together).
+        self._rcmd_down = False
+        self._rshift_down = False
+        self._chord_latched = False   # so one chord fires on_toggle exactly once
 
     def _dispatch(self, fn):
         """Run a user handler off the tap callback thread.
@@ -99,6 +109,7 @@ class HotkeyListener:
 
                 if keycode == HOTKEY_KEYCODE:
                     key_down = bool(flags & HOTKEY_FLAG)
+                    listener._rcmd_down = key_down
                     now = time.monotonic()
                     if key_down and not listener._key_down:
                         listener._key_down = True
@@ -120,11 +131,30 @@ class HotkeyListener:
                         else:
                             _log(f"Right Cmd RELEASE detected (held {hold_duration:.3f}s)")
                             listener._dispatch(listener._on_release)
+                    listener._check_lock_chord()
+                elif keycode == LOCK_KEYCODE:
+                    # Right Shift changed — only relevant for the lock chord.
+                    listener._rshift_down = bool(flags & LOCK_FLAG)
+                    listener._check_lock_chord()
             except Exception as e:
                 _log(f"callback error: {e}")
             return event
 
         return tap_callback
+
+    def _check_lock_chord(self):
+        """Fire on_toggle once when Right Shift + Right Command are both held.
+
+        Latched so a single chord fires exactly one toggle; the latch clears when
+        either key lifts, so the next chord fires again. Kept tiny + non-blocking
+        (the handler is dispatched to a worker thread) so the tap never stalls."""
+        if self._rcmd_down and self._rshift_down:
+            if not self._chord_latched:
+                self._chord_latched = True
+                _log("Right Shift+Cmd LOCK chord detected")
+                self._dispatch(self._on_toggle)
+        else:
+            self._chord_latched = False
 
     def _create_tap(self):
         """Create the CGEventTap, attach it to the main run loop, enable it.

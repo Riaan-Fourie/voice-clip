@@ -71,6 +71,15 @@ TRANSCRIBE_STUCK_TIMEOUT = 30.0
 # recovery is automatic within ~5s of crossing the timeout, with no user keypress.
 TRANSCRIBE_WATCHDOG_INTERVAL = 5.0
 
+# The re-exec watchdog only fires when the transcribe THREAD is still alive (a true
+# native Metal wedge). But jarvis-system #6 recorded the app sitting dead for HOURS
+# while the gate merely "leaked … resetting" on a loop — the wedge was elsewhere
+# (a hung recorder.stop, or a stale thread handle), so the classifier kept choosing
+# the cheap reset and never escalated. This is the backstop: N consecutive gate-resets
+# with no successful transcription in between means something a reset can't fix is
+# stuck, so escalate to a full re-exec — the same recovery a native wedge already gets.
+RESET_ESCALATE_THRESHOLD = 3
+
 os.makedirs(STATE_DIR, exist_ok=True)
 
 logging.basicConfig(
@@ -108,7 +117,17 @@ class VoiceClipApp(rumps.App):
         self.transcriber = Transcriber()
         _log("init: transcriber done")
         self._key_pressed = False
+        # Recording state machine. mode: None (idle) | "hold" (classic hold Right-Cmd,
+        # stops on release) | "locked" (hands-free, started/stopped by the Right-Shift+Cmd
+        # toggle so you can walk away from the keyboard). _recording gates both.
+        self._recording = False
+        self._mode = None
+        # Serialise the press/release/toggle handlers — they arrive on separate
+        # dispatch threads and a chord can race a plain press, which without this
+        # could double-open the recorder.
+        self._rec_lock = threading.RLock()
         self._transcribing = False
+        self._consecutive_resets = 0  # gate-leak resets since the last good transcription
         self._transcribe_started_at = 0.0  # monotonic ts; backstop for a hung transcribe
         self._transcribe_thread = None  # the in-flight worker; lets the watchdog tell a
         #                                 true native wedge (alive) from a leaked gate (dead)
@@ -147,6 +166,7 @@ class VoiceClipApp(rumps.App):
         self._hotkey = HotkeyListener(
             on_press=self._on_hotkey_press,
             on_release=self._on_hotkey_release,
+            on_toggle=self._on_hotkey_toggle,
         )
         self._hotkey.start()
         log.info("Hotkey listener started")
@@ -159,30 +179,39 @@ class VoiceClipApp(rumps.App):
         )
         self._transcribe_watchdog_thread.start()
 
-    def _on_hotkey_press(self):
-        """Right Command pressed — start recording."""
-        if self._transcribing:
-            # A transcription is in flight. If it has hung past the timeout, recover
-            # before starting a new recording; otherwise it's legitimately busy.
-            action = self._stuck_recovery_action()
-            if action == "busy":
-                return
-            stuck_for = time.monotonic() - self._transcribe_started_at
-            if action == "reexec":
-                # Thread still alive past the timeout = wedged in the native
-                # mlx_whisper/Metal call. No reset can unwedge it (jarvis-system #6).
-                log.error(f"Transcription wedged {stuck_for:.0f}s (on press) — re-execing")
-                _log(f"Transcription wedged {stuck_for:.0f}s (on press) — re-execing")
-                self._reexec()  # never returns
-            else:  # "reset" — gate leaked but the worker already died (issue #170)
-                log.warning(f"_transcribing gate leaked {stuck_for:.0f}s — force-resetting")
-                _log(f"_transcribing gate leaked {stuck_for:.0f}s — force-resetting")
-                self._transcribing = False
-        if self._key_pressed:
-            return
-        log.info("Hotkey pressed — start recording")
-        self._key_pressed = True
-        self._set_status("Recording...")
+    def _recover_if_stuck(self) -> bool:
+        """If a transcription is in flight, decide whether we can start a new
+        recording. Returns True if the caller should abort (legitimately busy).
+
+        Shared by the press path and the lock toggle so both agree on recovery.
+        """
+        if not self._transcribing:
+            return False
+        action = self._stuck_recovery_action()
+        if action == "busy":
+            return True
+        stuck_for = time.monotonic() - self._transcribe_started_at
+        if action == "reexec":
+            # Thread still alive past the timeout = wedged in the native
+            # mlx_whisper/Metal call. No reset can unwedge it (jarvis-system #6).
+            log.error(f"Transcription wedged {stuck_for:.0f}s (on press) — re-execing")
+            _log(f"Transcription wedged {stuck_for:.0f}s (on press) — re-execing")
+            self._reexec()  # never returns
+        # "reset" — gate leaked but the worker already died (issue #170)
+        log.warning(f"_transcribing gate leaked {stuck_for:.0f}s — force-resetting")
+        _log(f"_transcribing gate leaked {stuck_for:.0f}s — force-resetting")
+        self._transcribing = False
+        self._note_gate_reset()  # escalates to re-exec if this keeps happening
+        return False
+
+    def _start_recording(self, mode: str):
+        """Begin capturing audio in the given mode ("hold" or "locked")."""
+        log.info(f"Start recording (mode={mode})")
+        self._recording = True
+        self._mode = mode
+        self._key_pressed = (mode == "hold")
+        label = "Recording (locked)..." if mode == "locked" else "Recording..."
+        self._set_status(label)
         self.title = "\U0001f534"  # 🔴
         self.overlay.show()
         try:
@@ -193,6 +222,8 @@ class VoiceClipApp(rumps.App):
             # never escape into the CGEventTap callback.
             log.error(f"recorder.start failed: {e}", exc_info=True)
             _log(f"recorder.start failed: {e}")
+            self._recording = False
+            self._mode = None
             self._key_pressed = False
             self.overlay.hide()
             self._set_status(f"Mic error: {str(e)[:40]}")
@@ -201,13 +232,23 @@ class VoiceClipApp(rumps.App):
             threading.Timer(3.0, self._reset_status).start()
             return
         if self.recorder.last_device_name:
-            self._set_status(f"Recording ({self.recorder.last_device_name})...")
+            suffix = " (locked)" if mode == "locked" else ""
+            self._set_status(f"Recording ({self.recorder.last_device_name}){suffix}...")
 
-    def _on_hotkey_release(self):
-        """Right Command released — stop recording and transcribe."""
-        if not self._key_pressed:
-            return
-        log.info("Hotkey released — stop recording")
+    def _on_hotkey_press(self):
+        """Right Command pressed — start a hold recording."""
+        with self._rec_lock:
+            if self._recover_if_stuck():
+                return
+            if self._recording:
+                return  # already recording (hold or locked) — ignore
+            self._start_recording("hold")
+
+    def _stop_and_transcribe(self):
+        """Stop capturing and kick off transcription of what was recorded."""
+        log.info("Stop recording — transcribe")
+        self._recording = False
+        self._mode = None
         self._key_pressed = False
         self._transcribing = True
         self._transcribe_started_at = time.monotonic()
@@ -229,6 +270,39 @@ class VoiceClipApp(rumps.App):
             target=self._safe_transcribe, args=(wav_bytes,), daemon=True
         )
         self._transcribe_thread.start()
+
+    def _on_hotkey_release(self):
+        """Right Command released — stop, but ONLY if this was a hold recording.
+        A locked recording ignores key release; it stops on the next toggle."""
+        with self._rec_lock:
+            if self._mode != "hold":
+                return
+            self._stop_and_transcribe()
+
+    def _on_hotkey_toggle(self):
+        """Right-Shift+Cmd chord — toggle hands-free (locked) recording.
+
+        idle   → start recording locked (walk away, keep talking)
+        locked → stop + transcribe
+        hold   → promote the in-progress hold to locked, so releasing the keys
+                 no longer stops it."""
+        with self._rec_lock:
+            if self._recording and self._mode == "locked":
+                log.info("Lock toggle — stop locked recording")
+                self._stop_and_transcribe()
+                return
+            if self._recording and self._mode == "hold":
+                log.info("Lock toggle — promote hold → locked")
+                self._mode = "locked"
+                self._key_pressed = False
+                name = self.recorder.last_device_name
+                suffix = f" ({name})" if name else ""
+                self._set_status(f"Recording{suffix} (locked)...")
+                return
+            if self._recover_if_stuck():
+                return
+            log.info("Lock toggle — start locked recording")
+            self._start_recording("locked")
 
     def _on_audio_level(self, level: float):
         """Called from recorder with current audio RMS level."""
@@ -279,6 +353,7 @@ class VoiceClipApp(rumps.App):
             threading.Timer(3.0, self._reset_status).start()
         elif text:
             log.info(f"Transcribed: {text[:80]}")
+            self._consecutive_resets = 0  # a healthy transcription clears the escalation
             _copy_to_clipboard(text)
             _paste_from_clipboard()
             self._set_status(f"Pasted: {text[:50]}...")
@@ -362,8 +437,28 @@ class VoiceClipApp(rumps.App):
                     log.warning(f"_transcribing gate leaked {stuck_for:.0f}s — resetting")
                     _log(f"_transcribing gate leaked {stuck_for:.0f}s — resetting")
                     self._transcribing = False
+                    self._note_gate_reset()  # escalates to re-exec on repeated leaks
             except Exception as e:
                 log.error(f"transcribe watchdog error: {e}", exc_info=True)
+
+    def _note_gate_reset(self):
+        """Record a gate-leak reset and escalate to a full re-exec if they keep
+        happening. The re-exec watchdog only fires for a *live* wedged thread, but
+        jarvis-system #6 saw the app dead for HOURS while the gate merely leaked and
+        reset on a loop (the wedge was elsewhere — a hung recorder.stop, a stale
+        thread handle — so `_stuck_recovery_action` kept picking the cheap reset). A
+        reset that a healthy transcription never follows means something a reset can't
+        fix is stuck; after RESET_ESCALATE_THRESHOLD in a row we re-exec (same
+        recovery a native wedge already gets). The counter is cleared by a genuinely
+        successful transcription in `_do_transcribe`."""
+        self._consecutive_resets += 1
+        log.warning(f"gate reset #{self._consecutive_resets} since last good transcription")
+        if self._consecutive_resets >= RESET_ESCALATE_THRESHOLD:
+            log.error(
+                f"{self._consecutive_resets} consecutive gate-resets with no successful "
+                "transcription — escalating to re-exec (jarvis-system #6)")
+            _log(f"{self._consecutive_resets} consecutive gate-resets — re-execing")
+            self._reexec()  # never returns
 
     def _reexec(self):
         """Replace this wedged process image with a fresh one — the automatic
