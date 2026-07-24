@@ -88,6 +88,39 @@ def _reinit_portaudio():
         _log(f"PortAudio re-init failed: {e}", tag="recorder")
 
 
+# App Nap defeats Bluetooth recording (Jarvis #277). Under a Cocoa run loop
+# (the real app always has one), macOS App-Naps the process and MUTES the AirPods
+# HFP mic to digital silence after ~4s of a recording — the built-in mic is
+# immune, and a plain no-run-loop process is immune, which is why it only bit on
+# AirPods in the live app. Holding a latency-critical activity assertion for the
+# duration of the stream stops the nap and the mic stays live. Witnessed: AirPods
+# went from dying at t=4s to strong audio through t=12s.
+_NS_ACTIVITY_USER_INITIATED = 0x00FFFFFF
+_NS_ACTIVITY_LATENCY_CRITICAL = 0xFF00000000
+_NS_ACTIVITY_OPTS = _NS_ACTIVITY_USER_INITIATED | _NS_ACTIVITY_LATENCY_CRITICAL
+
+
+def _begin_no_nap():
+    """Return an activity token that keeps the process out of App Nap, or None."""
+    try:
+        from Foundation import NSProcessInfo
+        return NSProcessInfo.processInfo().beginActivityWithOptions_reason_(
+            _NS_ACTIVITY_OPTS, "VoiceClip recording (keep Bluetooth mic alive)")
+    except Exception as e:
+        _log(f"App Nap assertion unavailable: {e}", tag="recorder")
+        return None
+
+
+def _end_no_nap(token):
+    if token is None:
+        return
+    try:
+        from Foundation import NSProcessInfo
+        NSProcessInfo.processInfo().endActivity_(token)
+    except Exception as e:
+        _log(f"App Nap assertion end failed: {e}", tag="recorder")
+
+
 def _find_input_device(devices, needle):
     """Return the index of the first input device whose name contains needle."""
     for i, dev in enumerate(devices):
@@ -183,6 +216,7 @@ class Recorder:
         self.mic_preference = mic_preference
         self.hooks = hooks
         self.last_device_name = None  # set on each start(); for status display
+        self._nap_token = None  # App Nap assertion held while the stream is open (#277)
 
     def _hook(self, name, *args):
         fn = getattr(self.hooks, name, None) if self.hooks else None
@@ -204,6 +238,9 @@ class Recorder:
                 return
             self._frames = []
             self._recording = True
+            # Keep the process out of App Nap for the whole recording, or the
+            # Bluetooth mic goes silent after ~4s (#277).
+            self._nap_token = _begin_no_nap()
             try:
                 device, name = resolve_with_refresh(self.mic_preference)
             except Exception as e:
@@ -245,6 +282,8 @@ class Recorder:
                 except Exception as e2:
                     if device is None:
                         self._recording = False
+                        _end_no_nap(self._nap_token)
+                        self._nap_token = None
                         self._hook("post_close")  # undo pre_open masking
                         raise
                     _log(f"open {name} failed after re-init ({e2}) — trying system default", tag="recorder")
@@ -253,6 +292,8 @@ class Recorder:
                         self._stream = self._open_stream(None)
                     except Exception:
                         self._recording = False
+                        _end_no_nap(self._nap_token)
+                        self._nap_token = None
                         self._hook("post_close")  # undo pre_open masking
                         raise
             self._stream.start()
@@ -274,6 +315,8 @@ class Recorder:
             if not self._recording:
                 return b""
             self._recording = False
+            _end_no_nap(self._nap_token)  # release the App Nap assertion (#277)
+            self._nap_token = None
             self._hook("pre_close")  # duck for the HFP→A2DP flip-back
             self._stream.stop()
             self._stream.close()
