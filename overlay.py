@@ -185,8 +185,8 @@ class MascotView(NSView):
             ay = mrect.origin.y + (1.0 - ny) * m
             anchors.append((ax, ay))
 
-        # reach: 0 → bolts just around the body, 1 → they can span the whole
-        # screen. Grows with how long this recording has been going.
+        # reach: 0 → a tight spark halo, 1 → a slightly bigger halo around the
+        # body (still bounded to the mascot, never the whole screen — #276).
         reach = max(0.0, min(1.0, self._elapsed / FILL_SECONDS))
         self._draw_lightning(anchors, cx, cy, m, reach, b.size.width, b.size.height)
 
@@ -207,17 +207,18 @@ class MascotView(NSView):
         midc = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 0.92, 0.36, 0.95)
         core = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 1.0)
 
-        diag = math.hypot(view_w, view_h)
-        # how far bolts can shoot: from ~half the body up toward the full screen,
-        # scaled by both the duration reach and the current voice level.
-        reach_len = reach * diag * 0.8 * (0.35 + 0.65 * level)
-        # as reach grows the fan opens from a ~150° spray to a full 360° storm
-        spread_range = math.radians(150 + reach * 210)
+        # Bolts stay a small HALO around the body — never screen-filling (#276).
+        # Reach is bounded to a fraction of the mascot size (not the screen
+        # diagonal), so the storm crackles around Pikachu without covering the
+        # text the user is dictating over.
+        reach_len = reach * span * 0.55 * (0.35 + 0.65 * level)
+        # keep the fan modest so bolts don't wrap around and cover the screen
+        spread_range = math.radians(150 + reach * 40)
 
         for (ax, ay) in anchors:
             ox, oy = ax - cx, ay - cy
             base_ang = math.atan2(oy, ox) if (ox or oy) else math.pi / 2.0
-            n = int(1 + intensity * 5 + reach * 9)   # more bolts as it fills
+            n = int(1 + intensity * 5 + reach * 3)   # a few more bolts, not a storm
             for i in range(n):
                 spread = (i / max(1, n - 1) - 0.5) * spread_range
                 a = base_ang + spread + (rng.random() - 0.5) * 0.4
