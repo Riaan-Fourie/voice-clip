@@ -301,6 +301,21 @@ class RecordingOverlay:
             NSRect(NSPoint(0, 0), frame.size))
         self._window.setContentView_(self._view)
 
+    def _pin_to_active_screen(self):
+        """Move the (full-screen) window onto whatever screen is active RIGHT NOW.
+
+        The window is created once but macOS is multi-monitor: mainScreen() at
+        creation time may not be where the user is looking on the next recording,
+        and screen.frame() carries a per-display origin. Without this the whole
+        overlay stays stranded on the screen it was born on and the mascot never
+        appears on the display the user is actually using (#275)."""
+        screen = NSScreen.mainScreen()
+        if screen is None:
+            return
+        frame = screen.frame()
+        self._window.setFrame_display_(frame, False)
+        self._view.setFrameSize_(frame.size)
+
     def show(self):
         if self._visible:
             return
@@ -308,6 +323,7 @@ class RecordingOverlay:
         def _show_on_main():
             _log(f"_show_on_main (thread={threading.current_thread().name})")
             self._ensure_window()
+            self._pin_to_active_screen()
             self._view._level = 0.0
             self._view._smooth = 0.0
             self._view._elapsed = 0.0   # restart the fill ramp each recording
