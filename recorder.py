@@ -1,17 +1,63 @@
 """Audio recorder using sounddevice — captures mic input to a WAV buffer."""
 
 import io
+import os
 import wave
 import threading
 import numpy as np
 import sounddevice as sd
 
-from utils import _log
+from utils import _log, STATE_DIR
 
 SAMPLE_RATE = 16000  # 16kHz — good for speech recognition
 CHANNELS = 1
 DTYPE = "int16"
 BLOCKSIZE = 1024
+
+# Audio observability (Jarvis #277). When VOICECLIP_DEBUG_AUDIO is truthy, every
+# recording logs a compact per-second RMS trace of what was actually captured, so
+# an intermittent "audio went silent mid-recording" bug is self-diagnosing from
+# the debug log alone (no need to re-derive it). Set VOICECLIP_DEBUG_AUDIO=wav to
+# ALSO dump each WAV to ~/.voice-clip/debug_recordings/ for offline inspection.
+_DEBUG_AUDIO = os.environ.get("VOICECLIP_DEBUG_AUDIO", "").strip().lower()
+_DEBUG_AUDIO_ON = _DEBUG_AUDIO not in ("", "0", "false", "no")
+_DEBUG_AUDIO_WAV = _DEBUG_AUDIO == "wav"
+
+
+def _trace_captured_audio(audio_data):
+    """Log a per-second RMS bar chart of a captured int16 mono buffer.
+
+    Cheap (numpy over a few seconds of 16kHz) and only runs under
+    VOICECLIP_DEBUG_AUDIO. A run of near-zero seconds after real speech is the
+    signature of the #277 mid-recording silence."""
+    try:
+        n = len(audio_data)
+        if n == 0:
+            _log("DEBUG_AUDIO: captured 0 frames", tag="recorder")
+            return
+        secs = max(1, int(round(n / SAMPLE_RATE)))
+        parts = []
+        for s in range(secs):
+            seg = audio_data[s * SAMPLE_RATE:(s + 1) * SAMPLE_RATE].astype(np.float32)
+            rms = float(np.sqrt(np.mean(seg ** 2))) if len(seg) else 0.0
+            parts.append(f"{s}s:{int(rms)}")
+        _log(f"DEBUG_AUDIO: {n/SAMPLE_RATE:.1f}s captured | per-sec RMS "
+             + " ".join(parts), tag="recorder")
+        if _DEBUG_AUDIO_WAV:
+            d = os.path.join(STATE_DIR, "debug_recordings")
+            os.makedirs(d, exist_ok=True)
+            # monotonic-ish name without Date.now: use frame count + a counter file
+            import glob
+            idx = len(glob.glob(os.path.join(d, "rec_*.wav")))
+            path = os.path.join(d, f"rec_{idx:04d}_{secs}s.wav")
+            with wave.open(path, "wb") as wf:
+                wf.setnchannels(CHANNELS)
+                wf.setsampwidth(2)
+                wf.setframerate(SAMPLE_RATE)
+                wf.writeframes(audio_data.tobytes())
+            _log(f"DEBUG_AUDIO: wrote {path}", tag="recorder")
+    except Exception as e:
+        _log(f"DEBUG_AUDIO trace failed: {e}", tag="recorder")
 
 # Microphone preference values. "airpods" is the default (Riaan dictates on
 # AirPods most of the day); note AirPods record over Bluetooth HFP, which is
@@ -238,6 +284,8 @@ class Recorder:
 
         # Convert frames to WAV bytes
         audio_data = np.concatenate(frames, axis=0) if frames else np.array([], dtype=DTYPE)
+        if _DEBUG_AUDIO_ON:
+            _trace_captured_audio(audio_data)
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
             wf.setnchannels(CHANNELS)
