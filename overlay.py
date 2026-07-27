@@ -290,17 +290,32 @@ class RecordingOverlay:
         self._window = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
             frame, style, NSBackingStoreBuffered, False,
         )
-        self._window.setLevel_(ABOVE_ALL_LEVEL)
         self._window.setOpaque_(False)
         self._window.setBackgroundColor_(NSColor.clearColor())
         self._window.setIgnoresMouseEvents_(True)   # click-through — never blocks the user
         self._window.setHidesOnDeactivate_(False)
         self._window.setFloatingPanel_(True)
         self._window.setCollectionBehavior_((1 << 0) | (1 << 8) | (1 << 4))
+        # ORDER MATTERS: setFloatingPanel_(True) forces the level to
+        # NSFloatingWindowLevel (3), silently discarding any earlier
+        # setLevel_(). Level 3 still wins against ordinary windows (level 0),
+        # which is why this hid for so long — but it is nowhere near high
+        # enough to clear a native-fullscreen space, so the mascot never drew
+        # over Comet. Always set the level LAST (#284).
+        self._raise_level()
 
         self._view = MascotView.alloc().initWithFrame_(
             NSRect(NSPoint(0, 0), frame.size))
         self._window.setContentView_(self._view)
+
+    def _raise_level(self):
+        """Force the panel back above every other window.
+
+        Re-asserted on every show() rather than only at creation: AppKit resets
+        a panel's level as a side effect of other setters (setFloatingPanel_ is
+        the one that bit us), so treating the level as write-once is how it
+        silently decays back to 3 (#284)."""
+        self._window.setLevel_(ABOVE_ALL_LEVEL)
 
     def _pin_to_active_screen(self):
         """Move the (full-screen) window onto whatever screen is active RIGHT NOW.
@@ -324,6 +339,7 @@ class RecordingOverlay:
         def _show_on_main():
             _log(f"_show_on_main (thread={threading.current_thread().name})")
             self._ensure_window()
+            self._raise_level()
             self._pin_to_active_screen()
             self._view._level = 0.0
             self._view._smooth = 0.0

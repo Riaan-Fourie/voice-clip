@@ -119,6 +119,18 @@
 - Also use `orderFrontRegardless()` instead of `orderFront_(None)`
 - Collection behavior: `canJoinAllSpaces | fullScreenAuxiliary | stationary`
 
+### setFloatingPanel_(True) silently clobbers the window level
+- `setFloatingPanel_(True)` forces the panel to `NSFloatingWindowLevel` (**3**), discarding
+  any `setLevel_()` called before it. Measured: `setLevel_(1100)` → `level()` is 1100, then
+  `setFloatingPanel_(True)` → `level()` is **3**.
+- Level 3 still beats ordinary windows (level 0), so the overlay looks fine over Chrome,
+  Finder and the desktop. It is **not** enough to clear a native-fullscreen space — the
+  mascot never drew over Comet (#284).
+- **Solution: always call `setLevel_(ABOVE_ALL_LEVEL)` LAST**, after `setFloatingPanel_`,
+  and re-assert it on every `show()` (`_raise_level()`) rather than treating it as write-once.
+- Verify with `CGWindowListCopyWindowInfo` — `kCGWindowLayer` for the Python overlay window
+  must read 1100, not 3. Do not trust the source order; measure the live window.
+
 ## LaunchAgent
 
 ### NEVER use launchctl/LaunchAgent to start VoiceClip
