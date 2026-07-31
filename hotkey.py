@@ -7,6 +7,11 @@ macOS disables the tap by timeout. Press/release handlers are therefore
 dispatched to worker threads, and a watchdog *recreates* the tap (not just
 re-enables it) if it ever goes dead — a plain CGEventTapEnable does not restore
 event delivery once the source is wedged.
+
+Modifier state is recomputed from every flagsChanged event rather than tracked
+as an up/down tally (see issue #290): a tally only stays correct if every single
+up-event is delivered, and one lost up-event latched a modifier "down" for the
+life of the process — silently promoting every hold to a locked recording.
 """
 
 import threading
@@ -25,6 +30,21 @@ HOTKEY_FLAG = 0x100000
 LOCK_KEYCODE = 60
 LOCK_FLAG = 0x20000
 
+# Device-dependent modifier bits (IOKit NX_DEVICE*KEYMASK). The generic masks
+# above are set by EITHER key of a pair, so they cannot tell left from right:
+# with Left-Cmd held, the Right-Cmd *up* event still carries 0x100000 and reads
+# as "still down". These bits are per-physical-key, so the true state of one key
+# can be read off any flagsChanged event regardless of what else is held (#290).
+NX_DEVICE_LSHIFT = 0x000002
+NX_DEVICE_RSHIFT = 0x000004
+NX_DEVICE_LCMD = 0x000008
+NX_DEVICE_RCMD = 0x000010
+# Both device bits of each pair — used to decide whether an event carries device
+# information at all before trusting it (see _physical_key_down).
+NX_DEVICE_SHIFT_PAIR = NX_DEVICE_LSHIFT | NX_DEVICE_RSHIFT
+NX_DEVICE_CMD_PAIR = NX_DEVICE_LCMD | NX_DEVICE_RCMD
+
+
 # Debounce: ignore press/release cycles shorter than this (seconds)
 MIN_HOLD_DURATION = 0.15
 # Cooldown: minimum gap between end of one recording and start of next (seconds)
@@ -36,6 +56,20 @@ WATCHDOG_INTERVAL = 5.0
 # If the tap is still disabled after this many consecutive watchdog checks
 # (i.e. a plain re-enable did not stick), tear it down and recreate it.
 RECREATE_AFTER_FAILED_CHECKS = 2
+
+
+def _physical_key_down(flags, device_mask, pair_mask, generic_mask):
+    """True if one specific physical modifier key is down, per `flags`.
+
+    Prefers the device-dependent bit, which is authoritative even when the other
+    key of the pair is held. Falls back to the generic mask when the event
+    carries no device bits for that pair at all — synthetic events (and some
+    remappers) set only the generic mask, and those must keep working exactly as
+    they did before #290.
+    """
+    if flags & pair_mask:
+        return bool(flags & device_mask)
+    return bool(flags & generic_mask)
 
 
 def _log(msg):
@@ -107,40 +141,85 @@ class HotkeyListener:
                 )
                 flags = Quartz.CGEventGetFlags(event)
 
+                # Recompute both physical keys from THIS event's flags, whatever
+                # key actually moved. flagsChanged carries the full current
+                # modifier state, so this is a correction as well as an update:
+                # a dropped up-event self-heals on the next modifier keystroke
+                # instead of latching for the process lifetime (#290).
+                listener._resync_modifiers(flags)
+
                 if keycode == HOTKEY_KEYCODE:
-                    key_down = bool(flags & HOTKEY_FLAG)
-                    listener._rcmd_down = key_down
-                    now = time.monotonic()
-                    if key_down and not listener._key_down:
-                        listener._key_down = True
-                        # Cooldown check: ignore if too soon after last release
-                        elapsed_since_release = now - listener._last_release_time
-                        if elapsed_since_release < COOLDOWN_AFTER_RELEASE:
-                            _log(f"Right Cmd PRESS ignored (cooldown: {elapsed_since_release:.3f}s < {COOLDOWN_AFTER_RELEASE}s)")
-                        else:
-                            listener._press_time = now
-                            _log("Right Cmd PRESS detected")
-                            listener._dispatch(listener._on_press)
-                    elif not key_down and listener._key_down:
-                        listener._key_down = False
-                        listener._last_release_time = now
-                        # Debounce: ignore if held for less than minimum duration
-                        hold_duration = now - listener._press_time
-                        if listener._press_time == 0.0 or hold_duration < MIN_HOLD_DURATION:
-                            _log(f"Right Cmd RELEASE ignored (hold: {hold_duration:.3f}s < {MIN_HOLD_DURATION}s)")
-                        else:
-                            _log(f"Right Cmd RELEASE detected (held {hold_duration:.3f}s)")
-                            listener._dispatch(listener._on_release)
+                    listener._process_rcmd_edge()
                     listener._check_lock_chord()
                 elif keycode == LOCK_KEYCODE:
                     # Right Shift changed — only relevant for the lock chord.
-                    listener._rshift_down = bool(flags & LOCK_FLAG)
+                    listener._check_lock_chord()
+                else:
+                    # Some other modifier moved. Nothing to trigger, but the
+                    # resync above may have just corrected a stale Right-Cmd or
+                    # Right-Shift — settle the resulting edge/latch so a lost
+                    # up-event cannot leave a recording running or the chord
+                    # armed (#290). Release-only: a recording must always be
+                    # able to stop, but must never START off a key the user
+                    # did not actually press.
+                    listener._process_rcmd_edge(allow_press=False)
                     listener._check_lock_chord()
             except Exception as e:
                 _log(f"callback error: {e}")
             return event
 
         return tap_callback
+
+    def _resync_modifiers(self, flags):
+        """Recompute Right-Cmd / Right-Shift physical state from an event's flags.
+
+        Authoritative rather than incremental: flagsChanged events carry the full
+        current modifier state, so this both updates and *corrects* the tracked
+        state. That is what makes a lost up-event survivable — the old code only
+        touched a key's flag inside its own keycode branch, so one missed
+        Right-Shift release latched `_rshift_down` True forever and every
+        subsequent Right-Cmd hold was promoted to a locked recording (#290).
+        """
+        self._rcmd_down = _physical_key_down(
+            flags, NX_DEVICE_RCMD, NX_DEVICE_CMD_PAIR, HOTKEY_FLAG
+        )
+        self._rshift_down = _physical_key_down(
+            flags, NX_DEVICE_RSHIFT, NX_DEVICE_SHIFT_PAIR, LOCK_FLAG
+        )
+
+    def _process_rcmd_edge(self, allow_press=True):
+        """Turn the resynced Right-Cmd state into press/release handler calls.
+
+        Debounce and cooldown are unchanged; only the source of truth moved from
+        an incremental tally to `_rcmd_down`. `allow_press=False` restricts this
+        to the release edge, used when some *other* modifier moved: correcting a
+        missed release there is a safety net, but firing a press would start a
+        recording off a key the user never touched.
+        """
+        key_down = self._rcmd_down
+        now = time.monotonic()
+        if key_down and not self._key_down:
+            if not allow_press:
+                return
+            self._key_down = True
+            # Cooldown check: ignore if too soon after last release
+            elapsed_since_release = now - self._last_release_time
+            if elapsed_since_release < COOLDOWN_AFTER_RELEASE:
+                _log(f"Right Cmd PRESS ignored (cooldown: {elapsed_since_release:.3f}s < {COOLDOWN_AFTER_RELEASE}s)")
+            else:
+                self._press_time = now
+                _log("Right Cmd PRESS detected")
+                self._dispatch(self._on_press)
+        elif not key_down and self._key_down:
+            self._key_down = False
+            self._last_release_time = now
+            # Debounce: ignore if held for less than minimum duration
+            hold_duration = now - self._press_time
+            if self._press_time == 0.0 or hold_duration < MIN_HOLD_DURATION:
+                _log(f"Right Cmd RELEASE ignored (hold: {hold_duration:.3f}s < {MIN_HOLD_DURATION}s)")
+            else:
+                _log(f"Right Cmd RELEASE detected (held {hold_duration:.3f}s)")
+                self._dispatch(self._on_release)
 
     def _check_lock_chord(self):
         """Fire on_toggle once when Right Shift + Right Command are both held.

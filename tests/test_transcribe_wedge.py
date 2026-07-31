@@ -94,6 +94,9 @@ def _make_app(**state):
     import main
 
     app = main.VoiceClipApp.__new__(main.VoiceClipApp)
+    # Lock mode (#273) made the press/release handlers take _rec_lock; bypassing
+    # __init__ leaves it unset, so supply it here or those paths raise.
+    app._rec_lock = threading.RLock()
     for k, v in state.items():
         setattr(app, k, v)
     return app
