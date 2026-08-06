@@ -131,6 +131,30 @@
 - Verify with `CGWindowListCopyWindowInfo` — `kCGWindowLayer` for the Python overlay window
   must read 1100, not 3. Do not trust the source order; measure the live window.
 
+### A long-lived overlay window can wedge — and AppKit will lie about it (#323)
+- The overlay panel is created once per process. After enough uptime + Space churn macOS
+  can leave that window **permanently unable to join any Space**. Measured on a 6-day-old
+  process: `alpha` animated 0.0 → 1.0, `kCGWindowLayer` 1100, bounds an exact match for the
+  display — and `kCGWindowIsOnscreen` **False** on every single recording. Nothing rendered
+  for six days.
+- **`NSWindow.isVisible()` is useless for this.** A wedged window reports visible, accepts
+  `setAlphaValue_` and `orderFrontRegardless` without error, and keeps a correct frame and
+  level. Only the WindowServer knows: check membership in
+  `CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly)` by `windowNumber()`.
+- **It is not a config bug — don't go hunting collection behaviours.** A throwaway process
+  creating panels with the *identical* level + `CanJoinAllSpaces|FullScreenAuxiliary|Stationary`
+  config rendered fine on the same fullscreen Space at the same moment. The *window instance*
+  is the stale thing, which is why re-asserting the screen (#275) or the level (#284) can't
+  rescue it — those patch a property of a window that itself needs replacing.
+- **Solution: verify on screen ~0.35s after `show()` and rebuild the panel if not** (see
+  `_verify_onscreen` / `_rebuild_window`). Check late — a probe inline after
+  `orderFrontRegardless` always reads False because compositing hasn't settled. Rebuild at
+  most once per recording, and never when healthy (rebuilding every show thrashes the
+  WindowServer and restarts the mascot animation). Re-arm the `NSTimer` after a rebuild — it
+  targets the *view*, which the rebuild replaces.
+- **The scariest part was the log.** `_show_on_main` → record → transcribe stayed perfectly
+  paired the whole six days. Any silent-render failure must log explicitly, or it is invisible.
+
 ## LaunchAgent
 
 ### NEVER use launchctl/LaunchAgent to start VoiceClip

@@ -55,14 +55,29 @@ MASCOT_BOTTOM_MARGIN = 110   # mascot centre this far up from the screen bottom
 # you talk, the more the storm consumes the screen.
 FILL_SECONDS = 16.0
 
+# How long after show() to ask the WindowServer whether the panel really made it
+# on screen. Long enough that compositing has settled (a check inline after
+# orderFrontRegardless always reads False), short enough that a rescue still
+# lands inside a normal press-and-hold recording (#323).
+_ONSCREEN_CHECK_DELAY = 0.35
+
 _ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 _GIF_PATH = os.path.join(_ASSET_DIR, "mascot.gif")
 _CHEEKS_PATH = os.path.join(_ASSET_DIR, "mascot_cheeks.json")
 
 
+_MASCOT_CACHE = None
+
+
 def _load_mascot():
     """Load the GIF frames (as NSImage) + baked per-frame delays and cheek
-    anchors. Returns (frames, delays, cheeks, frame_size) or None on any failure."""
+    anchors. Returns (frames, delays, cheeks, frame_size) or None on any failure.
+
+    Cached process-wide: the window (and with it the view) is now rebuilt when it
+    wedges (#323), and a rebuild must not cost 20 GIF decodes off disk mid-recording."""
+    global _MASCOT_CACHE
+    if _MASCOT_CACHE is not None:
+        return _MASCOT_CACHE
     try:
         with open(_CHEEKS_PATH) as f:
             meta = json.load(f)
@@ -84,7 +99,8 @@ def _load_mascot():
         if not frames:
             return None
         _log(f"mascot: loaded {len(frames)} frames from {_GIF_PATH}")
-        return frames, delays, cheeks, (fw, fh)
+        _MASCOT_CACHE = (frames, delays, cheeks, (fw, fh))
+        return _MASCOT_CACHE
     except Exception as e:
         _log(f"mascot: load failed: {e}")
         return None
@@ -276,6 +292,7 @@ class RecordingOverlay:
         self._view = None
         self._timer = None
         self._visible = False
+        self._rebuilt_this_show = False
 
     def _ensure_window(self):
         if self._window is not None:
@@ -332,6 +349,87 @@ class RecordingOverlay:
         self._window.setFrame_display_(frame, False)
         self._view.setFrameSize_(frame.size)
 
+    def _is_onscreen(self):
+        """WindowServer truth: is our panel actually composited on the ACTIVE Space?
+
+        NSWindow.isVisible() is useless here — a wedged window keeps reporting
+        visible, keeps accepting setAlphaValue_/orderFrontRegardless, and keeps
+        its correct frame and level, while the WindowServer displays nothing.
+        Only the on-screen window list knows the difference (#323)."""
+        if self._window is None:
+            return False
+        try:
+            wid = self._window.windowNumber()
+            if wid <= 0:
+                return False
+            info = Quartz.CGWindowListCopyWindowInfo(
+                Quartz.kCGWindowListOptionOnScreenOnly
+                | Quartz.kCGWindowListExcludeDesktopElements,
+                Quartz.kCGNullWindowID,
+            ) or []
+            return any(w.get("kCGWindowNumber") == wid for w in info)
+        except Exception as e:
+            # Never let a diagnostic take the overlay down — assume healthy.
+            _log(f"onscreen check failed: {e}")
+            return True
+
+    def _rebuild_window(self):
+        """Throw the panel away and build a fresh one.
+
+        The panel is otherwise created exactly once per process. After enough
+        uptime and Space churn macOS can leave it permanently unable to join any
+        Space, and no amount of re-asserting screen (#275) or level (#284)
+        rescues it — the window itself is the stale thing. Rebuilding is the only
+        way out, and it is cheap: the mascot frames are cached module-wide."""
+        old = self._window
+        self._window = None
+        self._view = None
+        if old is not None:
+            try:
+                old.orderOut_(None)
+                old.close()
+            except Exception as e:
+                _log(f"rebuild: closing old window failed: {e}")
+        self._ensure_window()
+
+    def _present(self):
+        """Raise, pin, reveal, and start the animation timer on the current panel."""
+        self._raise_level()
+        self._pin_to_active_screen()
+        self._window.setAlphaValue_(1.0)
+        self._window.orderFrontRegardless()
+        if self._timer is not None:
+            self._timer.invalidate()
+        # NB: the timer targets self._view, so it MUST be re-armed after a
+        # rebuild — the old timer would tick a view that is no longer on screen.
+        self._timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            1.0 / 30.0, self._view,
+            objc.selector(MascotView.advance_, signature=b"v@:@"),
+            None, True,
+        )
+
+    def _verify_onscreen(self):
+        """One-shot rescue, ~a third of a second after show().
+
+        Runs late deliberately: the WindowServer needs a moment to composite, so
+        checking inline right after orderFrontRegardless would false-positive."""
+        if not self._visible or self._window is None:
+            return                      # recording already ended — nothing to rescue
+        if self._rebuilt_this_show:
+            return                      # one rebuild per recording, never a loop
+        if self._is_onscreen():
+            return                      # healthy: no rebuild, no flicker
+        self._rebuilt_this_show = True
+        _log("WEDGED: overlay window never joined the active Space — rebuilding (#323)")
+        self._rebuild_window()
+        self._view._level = 0.0
+        self._view._smooth = 0.0
+        self._view._elapsed = 0.0
+        self._present()
+        _log("rebuild %s" % ("succeeded — mascot is on screen"
+                             if self._is_onscreen() else
+                             "FAILED — still off screen after rebuild"))
+
     def show(self):
         if self._visible:
             return
@@ -339,19 +437,17 @@ class RecordingOverlay:
         def _show_on_main():
             _log(f"_show_on_main (thread={threading.current_thread().name})")
             self._ensure_window()
-            self._raise_level()
-            self._pin_to_active_screen()
             self._view._level = 0.0
             self._view._smooth = 0.0
             self._view._elapsed = 0.0   # restart the fill ramp each recording
-            self._window.setAlphaValue_(1.0)
-            self._window.orderFrontRegardless()
+            self._present()
             self._visible = True
-            self._timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-                1.0 / 30.0, self._view,
-                objc.selector(MascotView.advance_, signature=b"v@:@"),
-                None, True,
-            )
+            self._rebuilt_this_show = False
+            # A wedged window fails silently — every call below succeeds and the
+            # log looks perfect while nothing renders. Verify against the
+            # WindowServer instead of trusting AppKit (#323).
+            from PyObjCTools import AppHelper
+            AppHelper.callLater(_ONSCREEN_CHECK_DELAY, self._verify_onscreen)
 
         if threading.current_thread() is threading.main_thread():
             _show_on_main()
