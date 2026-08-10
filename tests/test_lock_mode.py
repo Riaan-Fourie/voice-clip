@@ -113,3 +113,56 @@ def test_chord_fires_toggle_once():
     hk._rshift_down = True
     hk._check_lock_chord()
     assert cb.call_count == 2
+
+
+# --- accidental-tap cancel (issue #327) ------------------------------------
+
+
+def test_cancel_stops_a_hold_recording(app):
+    """THE BUG: a sub-threshold tap opened the mic and nothing ever closed it."""
+    app._on_hotkey_press()              # tap starts a hold recording
+    assert app._recording is True
+    app._on_hotkey_cancel()             # released too fast to be a real hold
+    assert app._recording is False
+    assert app._mode is None
+    app.recorder.stop.assert_called_once()
+
+
+def test_cancel_does_not_transcribe(app):
+    """An accidental tap is not speech — no transcription thread may spawn."""
+    app._on_hotkey_press()
+    app.transcriber.transcribe.reset_mock()
+    app._on_hotkey_cancel()
+    app.transcriber.transcribe.assert_not_called()
+
+
+def test_cancel_leaves_locked_recording_alone(app):
+    """Hands-free is deliberate; it stops only on the next toggle."""
+    app._on_hotkey_toggle()             # start locked
+    app.recorder.stop.reset_mock()
+    app._on_hotkey_cancel()             # stray short tap
+    assert app._recording is True
+    assert app._mode == "locked"
+    app.recorder.stop.assert_not_called()
+
+
+def test_cancel_when_idle_is_a_noop(app):
+    app._on_hotkey_cancel()
+    assert app._recording is False
+    app.recorder.stop.assert_not_called()
+
+
+def test_cancel_survives_a_failing_recorder_stop(app):
+    """A mic teardown error must not escape into the hotkey thread."""
+    app._on_hotkey_press()
+    app.recorder.stop.side_effect = RuntimeError("device vanished")
+    app._on_hotkey_cancel()             # must not raise
+    assert app._recording is False
+
+
+def test_no_path_leaves_recorder_running_after_a_tap(app):
+    """The #327 invariant, stated directly."""
+    app._on_hotkey_press()
+    app._on_hotkey_cancel()
+    assert app._recording is False
+    assert app._mode is None

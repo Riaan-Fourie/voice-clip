@@ -79,10 +79,12 @@ def _log(msg):
 class HotkeyListener:
     """Listens for Right Command key press/release using CGEventTap on the main run loop."""
 
-    def __init__(self, on_press=None, on_release=None, on_toggle=None):
+    def __init__(self, on_press=None, on_release=None, on_toggle=None,
+                 on_cancel=None):
         self._on_press = on_press
         self._on_release = on_release
         self._on_toggle = on_toggle
+        self._on_cancel = on_cancel
         self._key_down = False
         self._tap = None
         self._source = None
@@ -216,7 +218,15 @@ class HotkeyListener:
             # Debounce: ignore if held for less than minimum duration
             hold_duration = now - self._press_time
             if self._press_time == 0.0 or hold_duration < MIN_HOLD_DURATION:
-                _log(f"Right Cmd RELEASE ignored (hold: {hold_duration:.3f}s < {MIN_HOLD_DURATION}s)")
+                # The press already opened the mic, so swallowing the release
+                # here strands the recorder in the recording state — it then
+                # captures room audio until some later, unrelated release clears
+                # the threshold, and the whole buffer transcribes as one stray
+                # fragment (#327: 27 runaways, median 25s, worst 217s).
+                # Debounce still means "this tap was an accident", so cancel
+                # rather than transcribe — but it must never mean "do nothing".
+                _log(f"Right Cmd RELEASE too short (hold: {hold_duration:.3f}s < {MIN_HOLD_DURATION}s) — cancelling")
+                self._dispatch(self._on_cancel)
             else:
                 _log(f"Right Cmd RELEASE detected (held {hold_duration:.3f}s)")
                 self._dispatch(self._on_release)

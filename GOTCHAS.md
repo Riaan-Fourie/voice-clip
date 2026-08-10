@@ -172,3 +172,27 @@
 - It calls `posix_spawn` to launch the real Python from `Python.framework/.../Python.app/Contents/MacOS/Python`
 - This means any .app bundle wrapping `python3` inherits the framework Python.app's identity for TCC purposes
 - **Cannot use Python.app as a proper macOS .app for TCC-gated features**
+
+## Gesture handling
+
+### Debouncing the release edge strands the recorder (Jarvis #327)
+- A press/release gesture is **asymmetric**: the press has a side effect (it opens the mic).
+- The original debounce rejected the *release* when the hold was shorter than
+  `MIN_HOLD_DURATION`, intending to discard accidental taps. But by then the press had
+  already started recording — so "ignore the release" meant "never stop the recorder".
+- The recorder then ran until some later, unrelated release happened to clear the
+  threshold. Every intermediate press also reset `_press_time`, which is why the final
+  stop logged a plausible-looking short hold.
+- **The symptom was not "stuck recording".** The overlay is easy to miss, so what the
+  user saw was a *short, truncated, unrelated transcript* — a 25s buffer of room audio
+  containing one stray sentence transcribes to one stray sentence. It was reported as
+  "VoiceClip is truncating my dictation", which sent diagnosis toward Whisper and the
+  mic (both innocent) rather than the hotkey state machine.
+- Measured over the live debug log before the fix: 27 runaways / 1346 hold recordings,
+  median 25.0s, worst 217.4s.
+- **Rule: a debounce may change *what a gesture means*, but it must never skip the
+  cleanup for a side effect that has already happened.** Sub-threshold releases now
+  dispatch `on_cancel` (stop the mic, discard the audio) instead of returning silently.
+- Diagnosis tip: `mlx_whisper.transcribe` returns *all* segments. If a long recording
+  yields a short transcript, suspect the **audio going in**, not the decoder — feed a
+  known-good long WAV through `Transcriber` to rule the decoder out in one step.
