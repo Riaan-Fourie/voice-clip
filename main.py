@@ -167,6 +167,7 @@ class VoiceClipApp(rumps.App):
             on_press=self._on_hotkey_press,
             on_release=self._on_hotkey_release,
             on_toggle=self._on_hotkey_toggle,
+            on_cancel=self._on_hotkey_cancel,
         )
         self._hotkey.start()
         log.info("Hotkey listener started")
@@ -278,6 +279,39 @@ class VoiceClipApp(rumps.App):
             if self._mode != "hold":
                 return
             self._stop_and_transcribe()
+
+    def _on_hotkey_cancel(self):
+        """Right Command released too fast to be a real hold — an accidental tap.
+
+        The press already opened the mic, so this MUST close it again. Before
+        #327 the sub-threshold release was simply swallowed, which left the
+        recorder running until some later unrelated release stopped it; the
+        resulting minutes-long buffer of room audio transcribed to one stray
+        sentence, which reads as "VoiceClip truncated my dictation".
+
+        The audio is discarded rather than transcribed — a hold this short is
+        by definition not speech the user meant to dictate.
+
+        A locked recording is untouched: it is deliberately hands-free and
+        stops only on the next lock toggle.
+        """
+        with self._rec_lock:
+            if not self._recording or self._mode != "hold":
+                return
+            log.info("Cancel recording — hold too short (accidental tap)")
+            _log("Cancel recording — hold too short (accidental tap)")
+            self._recording = False
+            self._mode = None
+            self._key_pressed = False
+            self.overlay.hide()
+            try:
+                self.recorder.stop()  # return value intentionally dropped
+            except Exception as e:
+                # Never let a mic teardown error escape into the hotkey thread;
+                # the gesture is already over and there is nothing to transcribe.
+                log.error(f"recorder.stop failed during cancel: {e}", exc_info=True)
+                _log(f"recorder.stop failed during cancel: {e}")
+            self._reset_status()
 
     def _on_hotkey_toggle(self):
         """Right-Shift+Cmd chord — toggle hands-free (locked) recording.
