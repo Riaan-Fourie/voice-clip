@@ -8,6 +8,7 @@ Requires Accessibility (hotkey) and Microphone permissions.
 """
 
 import atexit
+import contextlib
 import fcntl
 import os
 import subprocess
@@ -80,6 +81,30 @@ TRANSCRIBE_WATCHDOG_INTERVAL = 5.0
 # stuck, so escalate to a full re-exec — the same recovery a native wedge already gets.
 RESET_ESCALATE_THRESHOLD = 3
 
+# A blocking call into the native audio stack (PortAudio → CoreAudio HAL) that has
+# not returned within this many seconds is deadlocked, not slow: a real start()/stop()
+# is milliseconds. Issue #333 caught PortAudio's `startStopCallback` calling
+# `AudioUnitGetProperty` from inside the CoreAudio IO workloop (holding the HAL mutex,
+# wanting the AudioToolbox mutex) while `FinishStoppingStream` on the Python thread
+# held AudioToolbox and wanted HAL — a textbook ABBA deadlock, 1647/1647 stack samples
+# frozen in it. The HAL mutex is PROCESS-GLOBAL, so once this happens the process can
+# never do audio again and no in-process reset can help: re-exec is the only recovery.
+AUDIO_CALL_STUCK_TIMEOUT = 10.0
+
+# How long a hotkey handler waits for `_rec_lock` before giving up on this gesture.
+# In #333 the lock was held forever by the deadlocked `recorder.stop()`, so every
+# later press blocked *inside the CGEventTap callback*. A tap callback that doesn't
+# return promptly is disabled by macOS, which would have cost us the hotkey itself on
+# top of the wedge. Bailing out keeps the tap responsive; the watchdog does recovery.
+REC_LOCK_ACQUIRE_TIMEOUT = 2.0
+
+# Heartbeat for the EXTERNAL watchdog (~/.voice-clip/watchdog.sh). Touched from the
+# main run loop, so a stale file means the run loop itself is wedged — the one failure
+# `ps -p <pid>` can never see, and the reason #333 sat dead for 31 minutes with four
+# recovery mechanisms armed and a "healthy" process.
+HEARTBEAT_PATH = os.path.join(STATE_DIR, "heartbeat")
+HEARTBEAT_INTERVAL = 5.0
+
 os.makedirs(STATE_DIR, exist_ok=True)
 
 logging.basicConfig(
@@ -131,6 +156,11 @@ class VoiceClipApp(rumps.App):
         self._transcribe_started_at = 0.0  # monotonic ts; backstop for a hung transcribe
         self._transcribe_thread = None  # the in-flight worker; lets the watchdog tell a
         #                                 true native wedge (alive) from a leaked gate (dead)
+        # In-flight blocking call into the native audio stack, guarded by
+        # `_audio_call()`. The watchdog re-execs if one never returns (#333).
+        self._audio_call_name = None
+        self._audio_call_started_at = 0.0
+        self._lock_timeout_logged = False  # log a lock timeout once, not per keypress
 
         # Build menu — Microphone submenu holds one check-marked item per
         # preference; picking one persists to ~/.voice-clip/settings.json.
@@ -180,6 +210,80 @@ class VoiceClipApp(rumps.App):
         )
         self._transcribe_watchdog_thread.start()
 
+        # Heartbeat for the external watchdog. Deliberately driven by a rumps.Timer
+        # (main run loop) rather than a daemon thread: a background thread would keep
+        # ticking while the run loop — and with it the CGEventTap — was wedged, which
+        # is exactly the false "healthy" reading we are trying to eliminate (#333).
+        self._touch_heartbeat()
+        self._heartbeat_timer = rumps.Timer(self._touch_heartbeat, HEARTBEAT_INTERVAL)
+        self._heartbeat_timer.start()
+
+    def _touch_heartbeat(self, _timer=None):
+        """Stamp the heartbeat file — proof the main run loop is still turning."""
+        try:
+            with open(HEARTBEAT_PATH, "w") as fh:
+                fh.write(f"{int(time.time())} {os.getpid()}\n")
+        except Exception as e:  # never let a disk hiccup kill the run loop
+            log.warning(f"heartbeat write failed: {e}")
+
+    @contextlib.contextmanager
+    def _audio_call(self, name: str):
+        """Mark a blocking call into the native audio stack as in-flight.
+
+        Everything between `recorder.start()`/`recorder.stop()` and CoreAudio is
+        native code holding native mutexes; Python cannot interrupt or time it out.
+        All we can do is record that we went in and when — the watchdog notices we
+        never came out and replaces the process (#333). Deliberately just two plain
+        attribute writes: the watchdog must be able to read this state without taking
+        any lock, because in a real wedge every lock in the app is already held.
+        """
+        self._audio_call_name = name
+        self._audio_call_started_at = time.monotonic()
+        try:
+            yield
+        finally:
+            self._audio_call_started_at = 0.0
+            self._audio_call_name = None
+
+    def _audio_wedge_seconds(self) -> float:
+        """Seconds the current native audio call has been in flight (0.0 if none).
+
+        Lock-free by design — see `_audio_call`.
+
+        `getattr` rather than plain attribute access because this runs inside the
+        watchdog, the last line of defence: if it ever raised (partially-built app,
+        an attribute renamed by a future refactor) the exception would be swallowed
+        by the loop's `except` and EVERY recovery mechanism would go quietly dead —
+        the same silent-failure shape as the bug it exists to catch.
+        """
+        started = getattr(self, "_audio_call_started_at", 0.0)
+        if not started:
+            return 0.0
+        return max(0.0, time.monotonic() - started)
+
+    def _acquire_rec_lock(self, what: str) -> bool:
+        """Take `_rec_lock` for a hotkey gesture, or give up and say so.
+
+        Returns False if the lock could not be taken in time — the caller must
+        return immediately rather than block. See REC_LOCK_ACQUIRE_TIMEOUT: this
+        runs on the CGEventTap callback thread, and blocking there gets the tap
+        killed by macOS on top of whatever wedged us (#333).
+        """
+        if self._rec_lock.acquire(timeout=REC_LOCK_ACQUIRE_TIMEOUT):
+            self._lock_timeout_logged = False
+            return True
+        if not self._lock_timeout_logged:
+            self._lock_timeout_logged = True
+            stuck = self._audio_wedge_seconds()
+            detail = (
+                f"native audio call '{self._audio_call_name}' in flight {stuck:.0f}s"
+                if stuck else "holder unknown"
+            )
+            log.error(f"{what}: _rec_lock unavailable after "
+                      f"{REC_LOCK_ACQUIRE_TIMEOUT:.0f}s — {detail}")
+            _log(f"{what}: _rec_lock unavailable — {detail}")
+        return False
+
     def _recover_if_stuck(self) -> bool:
         """If a transcription is in flight, decide whether we can start a new
         recording. Returns True if the caller should abort (legitimately busy).
@@ -216,7 +320,8 @@ class VoiceClipApp(rumps.App):
         self.title = "\U0001f534"  # 🔴
         self.overlay.show()
         try:
-            self.recorder.start()
+            with self._audio_call("recorder.start"):
+                self.recorder.start()
         except Exception as e:
             # A dead mic must NEVER be a silent no-op (#265: five recordings
             # failed with zero user-visible signal) — and an exception must
@@ -238,12 +343,16 @@ class VoiceClipApp(rumps.App):
 
     def _on_hotkey_press(self):
         """Right Command pressed — start a hold recording."""
-        with self._rec_lock:
+        if not self._acquire_rec_lock("press"):
+            return
+        try:
             if self._recover_if_stuck():
                 return
             if self._recording:
                 return  # already recording (hold or locked) — ignore
             self._start_recording("hold")
+        finally:
+            self._rec_lock.release()
 
     def _stop_and_transcribe(self):
         """Stop capturing and kick off transcription of what was recorded."""
@@ -257,7 +366,8 @@ class VoiceClipApp(rumps.App):
         self.title = "\u23f3"  # ⏳
         self.overlay.hide()
 
-        wav_bytes = self.recorder.stop()
+        with self._audio_call("recorder.stop"):
+            wav_bytes = self.recorder.stop()
 
         if not wav_bytes or len(wav_bytes) < 1000:
             self._set_status("Ready (recording too short)")
@@ -275,10 +385,14 @@ class VoiceClipApp(rumps.App):
     def _on_hotkey_release(self):
         """Right Command released — stop, but ONLY if this was a hold recording.
         A locked recording ignores key release; it stops on the next toggle."""
-        with self._rec_lock:
+        if not self._acquire_rec_lock("release"):
+            return
+        try:
             if self._mode != "hold":
                 return
             self._stop_and_transcribe()
+        finally:
+            self._rec_lock.release()
 
     def _on_hotkey_cancel(self):
         """Right Command released too fast to be a real hold — an accidental tap.
@@ -295,7 +409,9 @@ class VoiceClipApp(rumps.App):
         A locked recording is untouched: it is deliberately hands-free and
         stops only on the next lock toggle.
         """
-        with self._rec_lock:
+        if not self._acquire_rec_lock("cancel"):
+            return
+        try:
             if not self._recording or self._mode != "hold":
                 return
             log.info("Cancel recording — hold too short (accidental tap)")
@@ -305,13 +421,16 @@ class VoiceClipApp(rumps.App):
             self._key_pressed = False
             self.overlay.hide()
             try:
-                self.recorder.stop()  # return value intentionally dropped
+                with self._audio_call("recorder.stop (cancel)"):
+                    self.recorder.stop()  # return value intentionally dropped
             except Exception as e:
                 # Never let a mic teardown error escape into the hotkey thread;
                 # the gesture is already over and there is nothing to transcribe.
                 log.error(f"recorder.stop failed during cancel: {e}", exc_info=True)
                 _log(f"recorder.stop failed during cancel: {e}")
             self._reset_status()
+        finally:
+            self._rec_lock.release()
 
     def _on_hotkey_toggle(self):
         """Right-Shift+Cmd chord — toggle hands-free (locked) recording.
@@ -320,7 +439,9 @@ class VoiceClipApp(rumps.App):
         locked → stop + transcribe
         hold   → promote the in-progress hold to locked, so releasing the keys
                  no longer stops it."""
-        with self._rec_lock:
+        if not self._acquire_rec_lock("toggle"):
+            return
+        try:
             if self._recording and self._mode == "locked":
                 log.info("Lock toggle — stop locked recording")
                 self._stop_and_transcribe()
@@ -337,6 +458,8 @@ class VoiceClipApp(rumps.App):
                 return
             log.info("Lock toggle — start locked recording")
             self._start_recording("locked")
+        finally:
+            self._rec_lock.release()
 
     def _on_audio_level(self, level: float):
         """Called from recorder with current audio RMS level."""
@@ -444,21 +567,40 @@ class VoiceClipApp(rumps.App):
         return "reset"
 
     def _transcribe_watchdog(self):
-        """Daemon loop: auto-recover a transcription wedged in native code.
+        """Daemon loop: auto-recover from a hang in native code, in either direction.
 
-        The #170 `finally` + the hotkey-press backstop clear the gate when the
-        transcribe thread *raises*. But a hang *inside* `mlx_whisper.transcribe`
-        (native Metal) never returns, so the thread stays alive and no in-process
-        reset can unwedge the GPU — every later press logs PRESS/RELEASE with no
-        Transcribing line until a manual restart (jarvis-system #6, 2026-06-30).
-        This loop detects that case and re-execs, with no user keypress required.
+        Two failure modes, both invisible to `ps` because the process stays alive:
 
-        It can run *because* a native Metal hang releases the GIL — confirmed by the
-        incident log still recording hotkey events while transcription was wedged.
+        1. AUDIO (#333) — `recorder.start()`/`stop()` deadlocks inside the CoreAudio
+           HAL. This one also holds `_rec_lock`, so it kills the entire hotkey path,
+           not just one recording. Checked first; always fatal, always re-exec.
+        2. TRANSCRIPTION (jarvis-system #6) — a hang inside `mlx_whisper.transcribe`
+           (native Metal) never returns, so the thread stays alive and no in-process
+           reset can unwedge the GPU. Every later press logs PRESS/RELEASE with no
+           Transcribing line until a manual restart.
+
+        This loop can run *because* both native hangs release the GIL — confirmed
+        twice by incident logs still recording hotkey events while wedged.
+
+        What this loop CANNOT catch is a wedge of the main run loop itself (it would
+        still tick happily). That is what the heartbeat + external watchdog.sh are
+        for; the two mechanisms are deliberately complementary.
         """
         while True:
             time.sleep(TRANSCRIBE_WATCHDOG_INTERVAL)
             try:
+                # Check the audio stack FIRST. A wedged CoreAudio call is strictly
+                # worse than a wedged transcription: it holds `_rec_lock`, so it
+                # takes the whole hotkey path down with it, and it poisons a
+                # process-global HAL mutex that no reset can clear (#333).
+                wedged_for = self._audio_wedge_seconds()
+                if wedged_for > AUDIO_CALL_STUCK_TIMEOUT:
+                    name = self._audio_call_name
+                    log.error(f"Native audio call '{name}' wedged {wedged_for:.0f}s "
+                              "— re-execing to recover (#333)")
+                    _log(f"Native audio call '{name}' wedged {wedged_for:.0f}s — re-execing")
+                    self._reexec()  # never returns
+
                 action = self._stuck_recovery_action()
                 if action == "busy":
                     continue
