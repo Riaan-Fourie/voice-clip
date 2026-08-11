@@ -68,6 +68,38 @@
 
 ## Audio
 
+### PortAudio can DEADLOCK CoreAudio while closing a stream (#333)
+- `recorder.stop()` never returned on 2026-08-11. Two threads, each holding the
+  lock the other wanted:
+  - **Python thread:** `FinishStoppingStream` -> `AudioOutputUnitStop` ->
+    `AudioDeviceStop_mac_imp` -> `HALC_ProxyIOContext::StopIOProc` ->
+    `HALB_Mutex::Lock()` — blocked
+  - **CoreAudio IO thread:** `HALC_ProxyIOContext::IOWorkLoop()` ->
+    PortAudio's `startStopCallback` -> `AudioUnitGetProperty` ->
+    `std::recursive_mutex::lock()` — blocked
+- PortAudio calls `AudioUnitGetProperty` from *inside* the IO workloop. Classic
+  ABBA. 1647/1647 stack samples frozen in it — stuck, not slow
+- Preceded in `stdout.log` by `PaMacCore (AUHAL) Error on line 1322: err='-10851'`
+- **The HAL mutex is PROCESS-GLOBAL.** Once this happens the process can never do
+  audio again; no flag reset, new `Recorder`, or stream reopen can help
+- **Solution: `_audio_call()` marks the call in flight, the watchdog re-execs
+  after `AUDIO_CALL_STUCK_TIMEOUT`.** Re-exec is the only recovery that exists
+- Suspected aggravator: `resolve_with_refresh()` re-initialises PortAudio on
+  EVERY recording when the preferred mic (AirPods) isn't connected — a lot of
+  AUHAL teardown/setup churn for a race to find. Not yet changed: rate-limiting
+  the refresh would regress the #265/#270 reconnect responsiveness
+
+### Diagnosing a wedged VoiceClip: `sample`, not py-spy
+- `py-spy dump` needs **root** on macOS (`task_for_pid`) — useless in a
+  non-interactive shell with no sudo password
+- `sample <pid> 2 -f out.txt` needs **no privileges** for your own process and
+  gives full native stacks — which is what you need anyway, because these
+  wedges are in CoreAudio/Metal, below Python
+- **Take the sample BEFORE killing.** The stack IS the diagnosis and a restart
+  destroys it forever. (#333's whole root cause came from one 2-second sample)
+- A wedged process **ignores SIGTERM** — the run loop never runs Python's signal
+  handler. Go straight to `kill -9`
+
 ### AirPods mic flips the Bluetooth link to HFP (harsh audible clip)
 - Opening ANY AirPods mic stream renegotiates A2DP -> HFP: playback crunches to
   call quality with a harsh clip, popping back ~1s after the mic closes
@@ -164,6 +196,23 @@
 - This completely breaks hotkey detection — the app appears to run fine but never receives key events
 - **Solution: Always start VoiceClip directly from Terminal** (`./venv/bin/python main.py &disown`)
 - For auto-start, consider Login Items (System Settings > General > Login Items) pointing to the .app bundle instead of launchd
+
+### "Is the process running?" is the WRONG health check (#333, jarvis-system #6)
+- Because VoiceClip must launch from Terminal (above), it sits outside launchd's
+  `KeepAlive`. `watchdog.sh` fills that gap on a 120s LaunchAgent timer
+- It used to test only `ps -p <pid> | grep main.py`. **Every serious VoiceClip
+  failure to date has left the process alive** — wedged transcriber, wedged
+  overlay, wedged CoreAudio — so it passed inspection through all of them
+- **Solution: heartbeat.** The app stamps `~/.voice-clip/heartbeat` every 5s from
+  the MAIN run loop; the watchdog kills + relaunches if it goes stale for 90s
+- **It must be driven by a `rumps.Timer`, not a daemon thread.** A background
+  thread keeps ticking while the run loop (and its CGEventTap) is wedged — that
+  would just re-create the false-healthy reading in a new place
+- Ignore a heartbeat whose pid ≠ the running pid: it's a leftover from the
+  previous run (or a just-completed re-exec), and judging a live process on it
+  would kill a healthy app
+- Deploy with `scripts/install-watchdog.sh` — the script and plist are in the
+  repo now. They were previously untracked, living only in `~/.voice-clip/`
 
 ## Packaging
 
