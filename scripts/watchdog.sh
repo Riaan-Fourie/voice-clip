@@ -56,16 +56,83 @@ may_relaunch() {
   [ $(( $(date +%s) - $(stat -f %m "$STAMP") )) -ge "$RELAUNCH_COOLDOWN" ]
 }
 
-relaunch() {
-  touch "$STAMP"
-  # stderr redirect is the crash evidence we've never had: deaths so far leave
-  # no trace in voiceclip-debug.log (it just stops).
-  osascript >/dev/null <<EOF
+# Close the Terminal windows our own launches leave behind (#407).
+#
+# Terminal keeps a window after its shell exits, showing "[Process completed]", and
+# macOS restores every one of those at the next login — so they compound. By
+# 2026-08-31 there were 9 corpses and zero running processes.
+#
+# The window cannot close itself: Terminal ignores `close` while the shell is alive,
+# and after the shell exits there is nothing left in the window to run the close. So
+# the reaping lands here, on the 120s poll.
+#
+# Three things this got wrong before and must not get wrong again:
+#
+#   1. `close` is a no-op unless Terminal is activated. Witnessed repeatedly during
+#      #407: the command returns success, no error, and the window stays. So we scan
+#      first WITHOUT activating (reading the window list is fine unfocused) and only
+#      steal focus when there is actually something to close — which, after this fix,
+#      means a login restore or a stop-without-relaunch. Rare, and self-limiting.
+#   2. Never close by an id read earlier. Terminal's window list goes stale within
+#      seconds; during #407 a close aimed at a dead window's id hit the LIVE VoiceClip
+#      window instead and killed the app. Close the object reference from the same
+#      iteration that tested it.
+#   3. `busy is false` is a hard guard, not an optimisation — it is what keeps a
+#      running VoiceClip (or any window Riaan has a process in) out of the loop.
+#
+# The scrollback marker is printed by run-voiceclip.sh. Matching on the title instead
+# would be guesswork: a restored corpse is titled plain "-zsh", like any idle window.
+MARKER="VOICECLIP-RUNNER-WINDOW"
+
+count_dead_windows() {
+  osascript 2>/dev/null <<EOF
 tell application "Terminal"
-    do script "cd '$DIR' && ./venv/bin/python main.py 2>> '$STATE/stderr.log'; exit"
+    set n to 0
+    repeat with w in (every window whose busy is false)
+        try
+            if (history of selected tab of w) contains "$MARKER" then set n to n + 1
+        end try
+    end repeat
+    return n
 end tell
 EOF
 }
+
+reap_dead_windows() {
+  local n
+  n=$(count_dead_windows)
+  [ -n "$n" ] && [ "$n" -gt 0 ] 2>/dev/null || return 0
+
+  log "reaping $n dead VoiceClip Terminal window(s)"
+  osascript >/dev/null 2>&1 <<EOF
+tell application "Terminal"
+    activate
+    delay 0.3
+    repeat with w in (every window whose busy is false)
+        try
+            if (history of selected tab of w) contains "$MARKER" then close w saving no
+        end try
+    end repeat
+end tell
+EOF
+}
+
+relaunch() {
+  touch "$STAMP"
+  # Corpses are cleared here as well as on the poll: `do script` is about to bring
+  # Terminal forward anyway, so the reap's activate costs nothing extra, and a
+  # crash-loop never gets to stack windows up in the first place.
+  reap_dead_windows
+  # The trailing `exit` matters: it ends the shell so the window becomes closeable at
+  # all. Without it the window sits at a live prompt and Terminal refuses to close it.
+  osascript >/dev/null <<EOF
+tell application "Terminal"
+    do script "'$DIR/scripts/run-voiceclip.sh'; exit"
+end tell
+EOF
+}
+
+reap_dead_windows
 
 # --- 1. EXISTENCE ------------------------------------------------------------
 if ! pid=$(running_pid); then
