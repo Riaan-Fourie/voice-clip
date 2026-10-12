@@ -66,6 +66,12 @@
 - The Recorder always writes 16-bit PCM, but a format-3 (IEEE-float) WAV reached the decoder on 2026-06-26. Python's stdlib `wave` module is PCM-only and raises `wave.Error: unknown format: 3` for it.
 - **Solution: `_wav_bytes_to_float32` falls back to libsndfile (`soundfile`) for anything `wave` rejects** (lazy import — only the rare non-PCM path pays the cost). `soundfile` had been removed from `requirements.txt`; it's back for this.
 
+### Maccy keeps every clipboard write unless told one replaces another (#629)
+- `pbcopy` (and any plain write) makes Maccy record a new history entry, so each dictation piled up.
+- Maccy honours `x.nspasteboard.ModifiedType`: a write carrying it, valued with an earlier write's `changeCount`, deletes that earlier entry. It also honours `org.nspasteboard.TransientType`, but that keeps a write out of history entirely, not just the old ones.
+- Maccy holds the `changeCount` → entry map in memory, so the chain breaks once whenever Maccy restarts. Never persist VoiceClip's side of it: the counter restarts at logout, and a stale value could delete an unrelated entry.
+- NSPasteboard is main-thread-only (not documented; reported from Apple), so `_copy_to_clipboard` hops to the main thread with a timeout and falls back to `pbcopy`.
+
 ## Audio
 
 ### PortAudio can DEADLOCK CoreAudio while closing a stream (#333)
