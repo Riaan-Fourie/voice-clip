@@ -81,13 +81,13 @@ Main Thread (NSApplication run loop)
 
 Background Threads (daemon)
 ├── Transcription thread (_do_transcribe)
-│   └── mlx_whisper.transcribe() → clipboard copy → simulated Cmd+V paste
+│   └── mlx_whisper.transcribe() → clipboard write (hops to main) → simulated Cmd+V paste
 ├── Retry thread (_do_retry)
 ├── Hotkey watchdog (re-enables CGEventTap every 30s)
 └── Timer threads (3s status reset after transcription)
 ```
 
-Key constraint: all AppKit/NSPanel operations must run on the main thread. The overlay dispatches via `AppHelper.callAfter` when called from background threads.
+Key constraint: all AppKit/NSPanel operations must run on the main thread. The overlay dispatches via `AppHelper.callAfter` when called from background threads. The clipboard write does the same and waits for it, because the paste right after reads the clipboard (`_copy_to_clipboard`, #629).
 
 ## Build / Release
 

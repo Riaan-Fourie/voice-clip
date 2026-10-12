@@ -18,6 +18,8 @@ import logging
 import sys
 
 import rumps
+from AppKit import NSPasteboard, NSPasteboardItem, NSPasteboardTypeString
+from PyObjCTools import AppHelper
 
 from recorder import (
     Recorder,
@@ -104,6 +106,24 @@ REC_LOCK_ACQUIRE_TIMEOUT = 2.0
 # recovery mechanisms armed and a "healthy" process.
 HEARTBEAT_PATH = os.path.join(STATE_DIR, "heartbeat")
 HEARTBEAT_INTERVAL = 5.0
+
+# Clipboard history (Maccy) should hold only the latest dictation, not every one
+# (#629). Maccy reads this pasteboard type as "this write replaces an earlier one":
+# its value is the changeCount of that earlier write, and Maccy deletes the entry it
+# recorded then. Clipboard managers that don't know the type ignore it.
+MACCY_MODIFIED_TYPE = "x.nspasteboard.ModifiedType"
+
+# changeCount of VoiceClip's own last clipboard write; main thread only. Kept in
+# memory on purpose: the counter restarts at logout, so a value saved to disk could
+# name an unrelated Maccy entry and delete it. The cost is that a restart of either
+# app leaves one older dictation behind.
+_last_clip_change_count = None
+
+# NSPasteboard is main-thread-only, so a clipboard write from the transcribe thread
+# hops to the main thread and waits this long for it. Past that the run loop is
+# wedged, and pbcopy writes the text instead: the dictation still lands and pastes,
+# but no later write can replace it, so that one stays in Maccy's history.
+CLIPBOARD_MAIN_THREAD_TIMEOUT = 2.0
 
 os.makedirs(STATE_DIR, exist_ok=True)
 
@@ -713,6 +733,57 @@ class VoiceClipApp(rumps.App):
 
 
 def _copy_to_clipboard(text: str):
+    """Copy text to the macOS clipboard, replacing VoiceClip's previous entry in
+    Maccy's history (#629). Blocks until the text is on the clipboard, because
+    the auto-paste that follows reads it."""
+    if threading.current_thread() is threading.main_thread():
+        _write_pasteboard(text)
+        return
+
+    done = threading.Event()
+    claim = threading.Lock()  # the main thread or the pbcopy fallback, never both
+    wrote = []
+
+    def _on_main():
+        if not claim.acquire(blocking=False):
+            return  # the fallback already wrote it
+        try:
+            _write_pasteboard(text)
+            wrote.append(True)
+        except Exception:
+            # An exception escaping into the run loop can take the whole app down.
+            log.exception("clipboard: pasteboard write failed, falling back to pbcopy")
+        finally:
+            done.set()
+
+    AppHelper.callAfter(_on_main)
+    if done.wait(CLIPBOARD_MAIN_THREAD_TIMEOUT):
+        if wrote:
+            return
+    elif claim.acquire(blocking=False):
+        log.error("clipboard: main thread did not take the write in "
+                  f"{CLIPBOARD_MAIN_THREAD_TIMEOUT}s, falling back to pbcopy")
+    elif done.wait(CLIPBOARD_MAIN_THREAD_TIMEOUT) and wrote:
+        return  # the main thread took it at the deadline and has finished
+    _pbcopy(text)
+
+
+def _write_pasteboard(text: str):
+    """Write text to the general pasteboard, marked as replacing VoiceClip's last
+    write so Maccy keeps only this one. Main thread only."""
+    global _last_clip_change_count
+    item = NSPasteboardItem.alloc().init()
+    item.setString_forType_(text, NSPasteboardTypeString)
+    if _last_clip_change_count is not None:
+        item.setString_forType_(str(_last_clip_change_count), MACCY_MODIFIED_TYPE)
+    pasteboard = NSPasteboard.generalPasteboard()
+    # clearContents returns the changeCount this write will carry, which is the
+    # key Maccy files the new entry under.
+    _last_clip_change_count = pasteboard.clearContents()
+    pasteboard.writeObjects_([item])
+
+
+def _pbcopy(text: str):
     """Copy text to macOS clipboard via pbcopy."""
     process = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
     process.communicate(text.encode("utf-8"))
