@@ -219,6 +219,11 @@
   would kill a healthy app
 - Deploy with `scripts/install-watchdog.sh` — the script and plist are in the
   repo now. They were previously untracked, living only in `~/.voice-clip/`
+- A stale heartbeat after sleep is NOT a wedge (#630). The heartbeat timer
+  can't fire while the Mac sleeps, and a DarkWake (a ~2s maintenance wake with
+  the lid shut) runs the watchdog before the app stamps again. Measure staleness
+  from the later of the last stamp and `kern.waketime`, which DarkWakes update
+  too, so only time awake counts
 
 ## Packaging
 

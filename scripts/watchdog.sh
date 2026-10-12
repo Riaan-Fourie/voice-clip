@@ -155,15 +155,27 @@ read -r hb_ts hb_pid _ < "$HEARTBEAT" || exit 0
 # it on someone else's timestamp would kill a perfectly healthy app.
 [ "$hb_pid" = "$pid" ] || exit 0
 
-age=$(( $(date +%s) - hb_ts ))
+# Sleep is not a wedge (#630). The heartbeat timer cannot fire while the Mac is
+# asleep, so after a long lid-closed sleep the stamp is as old as the sleep. A
+# DarkWake (a ~2s maintenance wake, lid still shut) runs this job before the app has
+# stamped again: on 2026-10-12 that killed a healthy app at 18:19 with the heartbeat
+# "997s stale", every second of it asleep. So only time AWAKE counts: measure from
+# the later of the last stamp and the last wake, which kern.waketime records for
+# DarkWakes too. A wedge that spans a sleep is still caught once the Mac has been
+# awake for STALE_AFTER.
+wake_ts=$(sysctl -n kern.waketime 2>/dev/null | sed -nE 's/.*sec = ([0-9]+),.*/\1/p')
+since=$hb_ts
+[ -n "$wake_ts" ] && [ "$wake_ts" -gt "$since" ] 2>/dev/null && since=$wake_ts
+
+age=$(( $(date +%s) - since ))
 [ "$age" -gt "$STALE_AFTER" ] || exit 0
 
 if ! may_relaunch; then
-  log "voiceclip pid $pid wedged (heartbeat ${age}s stale) — in relaunch cooldown, leaving it"
+  log "voiceclip pid $pid wedged (no heartbeat for ${age}s awake) — in relaunch cooldown, leaving it"
   exit 0
 fi
 
-log "voiceclip pid $pid ALIVE BUT WEDGED (heartbeat ${age}s stale) — killing and relaunching"
+log "voiceclip pid $pid ALIVE BUT WEDGED (no heartbeat for ${age}s awake) — killing and relaunching"
 # SIGTERM is not enough: a wedged run loop never runs Python's signal handler, so
 # the polite signal is simply ignored (witnessed in #333). Go straight to SIGKILL.
 kill -9 "$pid" 2>/dev/null
