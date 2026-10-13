@@ -8,13 +8,24 @@ SANDBOX=$(mktemp -d)
 export HOME="$SANDBOX"
 mkdir -p "$HOME/.voice-clip" "$SANDBOX/bin"
 
-# Stub osascript: record the relaunch instead of performing it.
+# Stub osascript: record a relaunch instead of performing it. The dead-window sweep
+# (#407) calls osascript on every run too, so only a `do script` counts (#630); the
+# sweep's window count comes back empty, which reads as "nothing to reap".
 cat > "$SANDBOX/bin/osascript" <<'EOF'
 #!/bin/bash
-cat > /dev/null
-echo "RELAUNCH_CALLED" >> "$HOME/.voice-clip/relaunch.calls"
+case "$(cat)" in
+  *"do script"*) echo "RELAUNCH_CALLED" >> "$HOME/.voice-clip/relaunch.calls" ;;
+esac
 EOF
 chmod +x "$SANDBOX/bin/osascript"
+
+# Stub sysctl: report the last wake as $FAKE_WAKETIME (default: never slept), so a
+# case never depends on when the machine running the tests last woke (#630).
+cat > "$SANDBOX/bin/sysctl" <<'EOF'
+#!/bin/bash
+echo "{ sec = ${FAKE_WAKETIME:-0}, usec = 0 } Thu Jan  1 00:00:00 1970"
+EOF
+chmod +x "$SANDBOX/bin/sysctl"
 export PATH="$SANDBOX/bin:$PATH"
 
 STATE="$HOME/.voice-clip"
@@ -81,6 +92,25 @@ touch "$STATE/watchdog.laststart"   # just relaunched → in cooldown
 bash "$WD" >/dev/null 2>&1
 check "no relaunch" 0 "$(relaunches)"
 check "process NOT orphan-killed" "alive" "$(ps -p "$pid" >/dev/null 2>&1 && echo alive || echo dead)"
+kill "$pid" 2>/dev/null
+
+echo "== 7. stale heartbeat, but the Mac only just woke → leave it alone (#630) =="
+reset_state
+pid=$(fake_app); echo "$pid" > "$STATE/voiceclip.pid"
+echo "$(( $(date +%s) - 1000 )) $pid" > "$STATE/heartbeat"   # stamped before a long sleep
+FAKE_WAKETIME=$(( $(date +%s) - 4 )) bash "$WD" >/dev/null 2>&1   # a DarkWake 4s ago
+check "no relaunch" 0 "$(relaunches)"
+check "sleeping app not killed" "alive" "$(ps -p "$pid" >/dev/null 2>&1 && echo alive || echo dead)"
+kill "$pid" 2>/dev/null
+
+echo "== 8. stale heartbeat, awake longer than the limit since waking → kill and relaunch (#630) =="
+reset_state
+pid=$(fake_app); echo "$pid" > "$STATE/voiceclip.pid"
+echo "$(( $(date +%s) - 1000 )) $pid" > "$STATE/heartbeat"
+FAKE_WAKETIME=$(( $(date +%s) - 200 )) bash "$WD" >/dev/null 2>&1   # woke 200s ago, no stamp since
+check "relaunched" 1 "$(relaunches)"
+check "wedge across a sleep still killed" "dead" "$(ps -p "$pid" >/dev/null 2>&1 && echo alive || echo dead)"
+check "logged awake time, not sleep" "yes" "$(grep -qE 'no heartbeat for (19[0-9]|20[0-9])s awake' "$STATE/watchdog.log" && echo yes || echo no)"
 kill "$pid" 2>/dev/null
 
 echo
