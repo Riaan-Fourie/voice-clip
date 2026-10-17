@@ -1,6 +1,6 @@
 #!/bin/bash
-# Exercise watchdog.sh's branches in a sandboxed HOME with osascript stubbed out,
-# so a "relaunch" is observable but never actually opens a Terminal window.
+# Exercise watchdog.sh's branches in a sandboxed HOME with launchctl stubbed out,
+# so a "relaunch" is observable but never restarts the real VoiceClip.
 set -uo pipefail
 
 WD="$1"
@@ -8,14 +8,20 @@ SANDBOX=$(mktemp -d)
 export HOME="$SANDBOX"
 mkdir -p "$HOME/.voice-clip" "$SANDBOX/bin"
 
-# Stub osascript: record a relaunch instead of performing it. The dead-window sweep
-# (#407) calls osascript on every run too, so only a `do script` counts (#630); the
-# sweep's window count comes back empty, which reads as "nothing to reap".
+# Stub launchctl: record a relaunch instead of performing it (#407).
+cat > "$SANDBOX/bin/launchctl" <<'EOF'
+#!/bin/bash
+case "$*" in
+  *kickstart*com.riaanfourie.voiceclip) echo "RELAUNCH_CALLED" >> "$HOME/.voice-clip/relaunch.calls" ;;
+esac
+EOF
+chmod +x "$SANDBOX/bin/launchctl"
+
+# Stub osascript: the dead-window sweep (#407) asks Terminal for windows whenever
+# Terminal is open. An empty count reads as "nothing to reap".
 cat > "$SANDBOX/bin/osascript" <<'EOF'
 #!/bin/bash
-case "$(cat)" in
-  *"do script"*) echo "RELAUNCH_CALLED" >> "$HOME/.voice-clip/relaunch.calls" ;;
-esac
+cat >/dev/null
 EOF
 chmod +x "$SANDBOX/bin/osascript"
 
