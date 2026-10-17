@@ -12,7 +12,9 @@ mkdir -p "$HOME/.voice-clip" "$SANDBOX/bin"
 cat > "$SANDBOX/bin/launchctl" <<'EOF'
 #!/bin/bash
 case "$*" in
-  *kickstart*com.riaanfourie.voiceclip) echo "RELAUNCH_CALLED" >> "$HOME/.voice-clip/relaunch.calls" ;;
+  *kickstart*com.riaanfourie.voiceclip)
+    echo "RELAUNCH_CALLED" >> "$HOME/.voice-clip/relaunch.calls"
+    exit "${FAKE_KICKSTART_RC:-0}" ;;
 esac
 EOF
 chmod +x "$SANDBOX/bin/launchctl"
@@ -118,6 +120,12 @@ check "relaunched" 1 "$(relaunches)"
 check "wedge across a sleep still killed" "dead" "$(ps -p "$pid" >/dev/null 2>&1 && echo alive || echo dead)"
 check "logged awake time, not sleep" "yes" "$(grep -qE 'no heartbeat for (19[0-9]|20[0-9])s awake' "$STATE/watchdog.log" && echo yes || echo no)"
 kill "$pid" 2>/dev/null
+
+echo "== 9. the LaunchAgent is missing → the failed relaunch is logged (#407) =="
+reset_state
+FAKE_KICKSTART_RC=113 bash "$WD" >/dev/null 2>&1
+check "relaunch attempted" 1 "$(relaunches)"
+check "failure logged" "yes" "$(grep -q 'RELAUNCH FAILED: launchctl kickstart rc=113' "$STATE/watchdog.log" && echo yes || echo no)"
 
 echo
 echo "passed=$pass failed=$fail"

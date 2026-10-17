@@ -125,7 +125,9 @@ relaunch() {
   touch "$STAMP"
   # launchd owns the process now (#407): -k stops any instance it still holds, then
   # starts the launcher again. No Terminal window.
-  launchctl kickstart -k "gui/$(id -u)/$AGENT_LABEL"
+  # A missing agent must be loud: without it nothing restarts VoiceClip at all.
+  launchctl kickstart -k "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1 \
+    || log "RELAUNCH FAILED: launchctl kickstart rc=$? (is $AGENT_LABEL loaded? run scripts/install-launcher.sh)"
 }
 
 reap_dead_windows

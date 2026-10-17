@@ -48,7 +48,6 @@ Runs locally on Apple Silicon using mlx-whisper (Metal GPU). No cloud APIs. Inte
 Installer output:
 - Creates `~/.voiceclip` (app + venv)
 - Creates `/Applications/VoiceClip.app`
-- Removes any legacy LaunchAgent from older installs
 
 ## Usage
 
