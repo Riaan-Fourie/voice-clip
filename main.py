@@ -666,9 +666,10 @@ class VoiceClipApp(rumps.App):
         mlx_whisper's process-global model singleton. `os.execv` keeps the PID but
         discards ALL in-process state, so the fresh image re-loads the model and
         re-attaches the CGEventTap from clean. The instance-lock fd is O_CLOEXEC, so
-        exec releases the flock and the new image re-acquires it. There is
-        deliberately no LaunchAgent (it breaks the CGEventTap), so self-relaunch via
-        execv — not self-exit — is the only crash-free recovery path.
+        exec releases the flock and the new image re-acquires it. execv keeps the
+        PID, so the process stays the launcher's child and keeps its Accessibility
+        and Microphone grants (GOTCHAS.md, #407), and it recovers at once instead
+        of waiting on launchd's restart throttle.
         """
         _log("re-exec: replacing process image to recover wedged transcription")
         log.error("re-exec: replacing process image to recover wedged transcription")

@@ -59,7 +59,7 @@
 - Why a reset isn't enough: Python can't kill the wedged worker thread, clearing the gate just piles the next recording behind the same stuck GPU queue, and a fresh `Transcriber` reuses `mlx_whisper`'s **process-global** model singleton. Nothing in-process clears a wedged Metal command queue.
 - **Solution: a background `_transcribe_watchdog` re-execs the process (`os.execv`) when a transcription is stuck past the timeout AND its worker thread is still alive** (`_stuck_recovery_action() == "reexec"`). `execv` keeps the PID but discards all in-process state — the automatic equivalent of the manual kill+restart. A *leaked* gate (worker already dead) still gets the cheap flag reset; only a live wedge re-execs.
 - The watchdog can run during a wedge **because a native Metal hang releases the GIL** (confirmed: the incident log still recorded hotkey events while transcription was wedged).
-- **Self-relaunch via `execv`, NOT self-exit**, because there is deliberately no LaunchAgent — a LaunchAgent breaks the CGEventTap (see the run-mode gotcha). Self-exit would leave the app dead.
+- **Self-relaunch via `execv`, NOT self-exit.** `execv` keeps the pid, so the process stays the launcher's child and keeps its grants, and recovery doesn't wait on launchd's restart throttle or the 120s watchdog.
 - The instance-lock fd is opened `O_CLOEXEC` so the exec releases the `flock` and the fresh image re-acquires it; without it the re-exec'd process would see the lock held and exit as a false "duplicate". Witnessed end-to-end by `tests/manual_reexec.py`.
 
 ### Whisper does not see only PCM — decode defensively
@@ -195,17 +195,27 @@
 
 ## LaunchAgent
 
-### NEVER use launchctl/LaunchAgent to start VoiceClip
-- Launching via launchd runs the process under a **different macOS security context**
-- Accessibility permission granted to Terminal/Python does NOT carry over to launchd-spawned processes
-- CGEventTap gets silently disabled by macOS immediately (every 30s the watchdog would re-enable it, macOS would disable it again)
-- This completely breaks hotkey detection — the app appears to run fine but never receives key events
-- **Solution: Always start VoiceClip directly from Terminal** (`./venv/bin/python main.py &disown`)
-- For auto-start, consider Login Items (System Settings > General > Login Items) pointing to the .app bundle instead of launchd
+### launchd must start the launcher app, NEVER python itself (#407)
+- macOS checks Accessibility and Microphone against the **responsible process**:
+  the app that started the process tree. From Terminal, that is Terminal
+- launchd makes every process it starts its own responsible process. A bare
+  `python main.py` LaunchAgent is judged as Python.app, which holds no grant
+- The CGEventTap is then silently disabled (every 30s the hotkey watchdog
+  re-enables it, macOS disables it again). The app looks fine and hears no keys
+- **Solution: `~/Applications/VoiceClip Launcher.app`** (`launcher/main.swift`).
+  It holds the two grants, and launchd starts it. It spawns python as a child,
+  and the child inherits the launcher's grants as it used to inherit Terminal's
+- **Spawn and wait, never exec.** An exec turns the responsible process into the
+  Python trampoline, and the grants are lost
+- **Never rebuild the launcher casually.** It is ad-hoc signed, so its grant is
+  pinned to the binary's hash. `scripts/install-launcher.sh` keeps the installed
+  app unless you pass `--rebuild`. After a rebuild, switch Accessibility on again
+- The launcher waits for Accessibility and asks for the mic before python
+  starts, so the one-time prompts never land mid-dictation
 
 ### "Is the process running?" is the WRONG health check (#333, jarvis-system #6)
-- Because VoiceClip must launch from Terminal (above), it sits outside launchd's
-  `KeepAlive`. `watchdog.sh` fills that gap on a 120s LaunchAgent timer
+- launchd's `KeepAlive` restarts VoiceClip after a crash or kill. A clean quit
+  stays quit. `watchdog.sh` covers the rest on a 120s LaunchAgent timer
 - It used to test only `ps -p <pid> | grep main.py`. **Every serious VoiceClip
   failure to date has left the process alive** — wedged transcriber, wedged
   overlay, wedged CoreAudio — so it passed inspection through all of them
@@ -230,8 +240,9 @@
 ### Python.app trampoline problem
 - The `python3` binary in a Homebrew/framework install is a small C trampoline
 - It calls `posix_spawn` to launch the real Python from `Python.framework/.../Python.app/Contents/MacOS/Python`
-- This means any .app bundle wrapping `python3` inherits the framework Python.app's identity for TCC purposes
+- This means any .app bundle that execs `python3` (a shell-script bundle) takes the framework Python.app's identity for TCC purposes
 - **Cannot use Python.app as a proper macOS .app for TCC-gated features**
+- A compiled launcher that spawns python as a child does work: the child inherits the launcher's responsibility (see the LaunchAgent gotcha)
 
 ## Gesture handling
 

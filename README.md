@@ -48,7 +48,6 @@ Runs locally on Apple Silicon using mlx-whisper (Metal GPU). No cloud APIs. Inte
 Installer output:
 - Creates `~/.voiceclip` (app + venv)
 - Creates `/Applications/VoiceClip.app`
-- Removes any legacy LaunchAgent from older installs
 
 ## Usage
 
@@ -63,9 +62,14 @@ pip install -r requirements.txt
 ./venv/bin/python main.py
 ```
 
-Do **not** run VoiceClip via LaunchAgent/`launchd` for hotkey capture.
-
-Optional auto-start: add `/Applications/VoiceClip.app` to Login Items.
+Headless auto-start from this repo, with no Terminal window:
+```bash
+./scripts/install-launcher.sh   # launcher app + LaunchAgent
+./scripts/install-watchdog.sh   # wedge watchdog
+```
+Then switch on **VoiceClip Launcher** in System Settings > Privacy & Security >
+Accessibility, and allow the microphone when asked. Never point a LaunchAgent at
+`python main.py` directly: the hotkey tap goes dead (see `GOTCHAS.md`).
 
 ## Uninstall
 

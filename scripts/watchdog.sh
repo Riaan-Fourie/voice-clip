@@ -5,11 +5,10 @@
 # com.riaanfourie.voiceclip-watchdog LaunchAgent. Install with:
 #     scripts/install-watchdog.sh
 #
-# Terminal launch is deliberate: CGEventTap needs Accessibility, which the python
-# process inherits from Terminal.app. That puts the process outside launchd's
-# supervision (com.riaanfourie.voiceclip only fires at login), so this polling job
-# fills the KeepAlive gap. VoiceClip's own single-instance lock makes a
-# false-positive relaunch harmless.
+# launchd starts VoiceClip through the launcher app (scripts/install-launcher.sh)
+# and restarts it after a crash. This job adds what launchd cannot see: a clean
+# exit it was told to leave alone, and a process that is alive but wedged.
+# VoiceClip's own single-instance lock makes a false-positive relaunch harmless.
 #
 # TWO health checks, because "the process exists" has now twice been the wrong one:
 #
@@ -23,7 +22,7 @@
 
 set -uo pipefail
 
-DIR="/Users/riaanfourie/Personal Projects/Jarvis/Jarvis/repos/voice-clip"
+AGENT_LABEL="com.riaanfourie.voiceclip"
 STATE="$HOME/.voice-clip"
 PIDFILE="$STATE/voiceclip.pid"
 HEARTBEAT="$STATE/heartbeat"
@@ -56,7 +55,9 @@ may_relaunch() {
   [ $(( $(date +%s) - $(stat -f %m "$STAMP") )) -ge "$RELAUNCH_COOLDOWN" ]
 }
 
-# Close the Terminal windows our own launches leave behind (#407).
+# Close the Terminal windows the old Terminal launch left behind (#407). VoiceClip
+# now starts headless through launchd, so this only clears windows that predate it,
+# including ones macOS restores at login.
 #
 # Terminal keeps a window after its shell exits, showing "[Process completed]", and
 # macOS restores every one of those at the next login — so they compound. By
@@ -80,7 +81,7 @@ may_relaunch() {
 #   3. `busy is false` is a hard guard, not an optimisation — it is what keeps a
 #      running VoiceClip (or any window Riaan has a process in) out of the loop.
 #
-# The scrollback marker is printed by run-voiceclip.sh. Matching on the title instead
+# The old runner script printed the scrollback marker. Matching on the title instead
 # would be guesswork: a restored corpse is titled plain "-zsh", like any idle window.
 MARKER="VOICECLIP-RUNNER-WINDOW"
 
@@ -99,6 +100,9 @@ EOF
 }
 
 reap_dead_windows() {
+  # Telling Terminal anything launches it. VoiceClip no longer runs in Terminal, so
+  # only look for leftover windows when Terminal is already open.
+  pgrep -xq Terminal || return 0
   local n
   n=$(count_dead_windows)
   [ -n "$n" ] && [ "$n" -gt 0 ] 2>/dev/null || return 0
@@ -119,17 +123,11 @@ EOF
 
 relaunch() {
   touch "$STAMP"
-  # Corpses are cleared here as well as on the poll: `do script` is about to bring
-  # Terminal forward anyway, so the reap's activate costs nothing extra, and a
-  # crash-loop never gets to stack windows up in the first place.
-  reap_dead_windows
-  # The trailing `exit` matters: it ends the shell so the window becomes closeable at
-  # all. Without it the window sits at a live prompt and Terminal refuses to close it.
-  osascript >/dev/null <<EOF
-tell application "Terminal"
-    do script "'$DIR/scripts/run-voiceclip.sh'; exit"
-end tell
-EOF
+  # launchd owns the process now (#407): -k stops any instance it still holds, then
+  # starts the launcher again. No Terminal window.
+  # A missing agent must be loud: without it nothing restarts VoiceClip at all.
+  launchctl kickstart -k "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1 \
+    || log "RELAUNCH FAILED: launchctl kickstart rc=$? (is $AGENT_LABEL loaded? run scripts/install-launcher.sh)"
 }
 
 reap_dead_windows

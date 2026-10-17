@@ -11,14 +11,15 @@ INSTALL_DIR="$HOME/.voiceclip"
 APP_DIR="$INSTALL_DIR/app"
 VENV_DIR="$INSTALL_DIR/venv"
 BUNDLE_DIR="/Applications/VoiceClip.app"
-LEGACY_LAUNCH_AGENT="$HOME/Library/LaunchAgents/com.riaanfourie.voiceclip.plist"
 LOG_DIR="$HOME/.voice-clip"
 SOURCE_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# This installer never touches ~/Library/LaunchAgents/com.riaanfourie.voiceclip.plist.
+# That agent is the headless launch from scripts/install-launcher.sh, and the
+# watchdog's relaunch depends on it (#407).
+
 if [[ "$1" == "--uninstall" ]]; then
     echo "Uninstalling VoiceClip..."
-    launchctl unload "$LEGACY_LAUNCH_AGENT" 2>/dev/null || true
-    rm -f "$LEGACY_LAUNCH_AGENT"
     rm -rf "$BUNDLE_DIR"
     rm -rf "$INSTALL_DIR"
     echo "VoiceClip uninstalled. Logs at $LOG_DIR were kept."
@@ -130,10 +131,6 @@ cat > "$BUNDLE_DIR/Contents/Info.plist" << 'PLIST'
 </dict>
 </plist>
 PLIST
-
-# Clean up legacy LaunchAgent from older installs
-launchctl unload "$LEGACY_LAUNCH_AGENT" 2>/dev/null || true
-rm -f "$LEGACY_LAUNCH_AGENT"
 
 echo ""
 echo "=============================="
