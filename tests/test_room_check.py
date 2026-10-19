@@ -156,6 +156,8 @@ def app(monkeypatch):
     monkeypatch.setattr(main, "load_settings", lambda: {})
     monkeypatch.setattr(main, "save_settings", lambda s: saved.update(s))
     monkeypatch.setattr(main, "_log", lambda *a, **k: None)
+    banners = []
+    monkeypatch.setattr(main, "_show_banner", lambda sub, msg: banners.append(sub))
     with mock.patch.object(main, "Recorder", return_value=rec), \
          mock.patch.object(main, "Transcriber", return_value=mock.Mock(get_failed_count=lambda: 0)), \
          mock.patch.object(main, "HotkeyListener", return_value=mock.Mock()), \
@@ -165,7 +167,13 @@ def app(monkeypatch):
     a.recorder = rec
     a._notify = mock.Mock()
     a.saved = saved
+    a.banners = banners
     return a
+
+
+def main_mod():
+    import main
+    return main
 
 
 class TestAppRoomCheck:
@@ -174,20 +182,20 @@ class TestAppRoomCheck:
         app._room_check()
         assert app.recorder.auto_choice == MIC_AIRPODS
         assert app.saved["auto_mic_choice"] == MIC_AIRPODS
-        assert app._notify.call_args[0][0] == "Mic: AirPods"
+        assert app.banners == ["Mic: AirPods"]
 
     def test_quiet_room_switches_back_to_macbook(self, app):
         app.recorder.auto_choice = MIC_AIRPODS
         app.recorder.take_probe_audio.return_value = _clip(4, 20, 1000)
         app._room_check()
         assert app.recorder.auto_choice == MIC_MACBOOK
-        assert app._notify.call_args[0][0] == "Mic: MacBook"
+        assert app.banners == ["Mic: MacBook"]
 
     def test_unchanged_choice_is_silent(self, app):
         app.recorder.take_probe_audio.return_value = _clip(4, 20, 1000)
         app._room_check()
         assert app.recorder.auto_choice == MIC_MACBOOK
-        app._notify.assert_not_called()
+        assert app.banners == []
         assert app.saved == {}
 
     def test_fixed_preference_never_checks(self, app):
@@ -203,6 +211,22 @@ class TestAppRoomCheck:
         check.assert_not_called()
         app.recorder.take_probe_audio.assert_called()  # stale clip discarded
 
+    def test_punctuation_only_transcript_skips_the_check(self, app):
+        app.transcriber.transcribe.return_value = ("!", None)
+        with mock.patch.object(main_mod(), "_copy_to_clipboard"), \
+             mock.patch.object(main_mod(), "_paste_from_clipboard"), \
+             mock.patch.object(app, "_room_check") as check:
+            app._do_transcribe(b"x")
+        check.assert_not_called()
+
+    def test_words_run_the_check(self, app):
+        app.transcriber.transcribe.return_value = ("Send it to Dewald.", None)
+        with mock.patch.object(main_mod(), "_copy_to_clipboard"), \
+             mock.patch.object(main_mod(), "_paste_from_clipboard"), \
+             mock.patch.object(app, "_room_check") as check:
+            app._do_transcribe(b"x")
+        check.assert_called_once()
+
     def test_restart_restores_the_last_choice(self, monkeypatch):
         import main
         rec = mock.Mock()
@@ -214,3 +238,12 @@ class TestAppRoomCheck:
              mock.patch.object(main.threading, "Thread", return_value=mock.Mock()):
             main.VoiceClipApp()
         assert rec.auto_choice == MIC_AIRPODS
+
+
+def test_banner_quotes_survive_osascript(monkeypatch):
+    import main
+    calls = []
+    monkeypatch.setattr(main.subprocess, "Popen", lambda args, **kw: calls.append(args))
+    main._show_banner('Mic: "AirPods"', 'a \\ b')
+    script = calls[0][2]
+    assert script == 'display notification "a \\\\ b" with title "VoiceClip" subtitle "Mic: \\"AirPods\\""'

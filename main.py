@@ -545,7 +545,8 @@ class VoiceClipApp(rumps.App):
             self.title = "\u2705"  # ✅
             self._notify("Copied to Clipboard", text[:100])
             threading.Timer(3.0, self._reset_status).start()
-            self._room_check()
+            if any(c.isalnum() for c in text):
+                self._room_check()
         else:
             self._set_status("No speech detected")
             self.title = "\U0001f399"  # 🎙
@@ -553,8 +554,9 @@ class VoiceClipApp(rumps.App):
 
     def _room_check(self):
         """Auto mic (#767): score the room on the MacBook mic and pick the mic
-        for the NEXT dictation. Runs only after a transcription found speech,
-        so a silent hold can never read as a noisy room. Never raises: the
+        for the NEXT dictation. Runs only after a transcription found words
+        (Whisper renders a silent or drowned clip as "!"), so a silent hold
+        can never read as a noisy room. Never raises: the
         dictation is already pasted, and a failed check just keeps the mic."""
         try:
             if self.recorder.mic_preference != MIC_AUTO:
@@ -565,7 +567,6 @@ class VoiceClipApp(rumps.App):
             new = next_choice(old, score)
             shown = "n/a" if score is None else f"{score:.1f} dB"
             log.info(f"Room check: Mac mic voice-to-noise {shown}, next dictation: {new}")
-            _log(f"Room check: Mac mic voice-to-noise {shown}, next dictation: {new}")
             if new == old:
                 return
             self.recorder.auto_choice = new
@@ -573,9 +574,9 @@ class VoiceClipApp(rumps.App):
             settings["auto_mic_choice"] = new
             save_settings(settings)
             if new == MIC_AIRPODS:
-                self._notify("Mic: AirPods", f"Noisy room ({shown}). The next dictation uses the AirPods.")
+                _show_banner("Mic: AirPods", f"Noisy room ({shown}). The next dictation uses the AirPods.")
             else:
-                self._notify("Mic: MacBook", f"Quiet room ({shown}). The next dictation uses the MacBook mic.")
+                _show_banner("Mic: MacBook", f"Quiet room ({shown}). The next dictation uses the MacBook mic.")
         except Exception as e:
             log.error(f"Room check failed: {e}", exc_info=True)
             _log(f"Room check failed: {e}")
@@ -770,6 +771,25 @@ class VoiceClipApp(rumps.App):
             message=message,
             sound=False,
         )
+
+
+def _show_banner(subtitle: str, message: str):
+    """A notification banner that actually reaches the screen.
+
+    `rumps.notification` posts as org.python.python, which has no entry in
+    Notification Centre settings, so macOS delivers it with no visible banner
+    (witnessed on #767: "Copied to Clipboard" has been invisible all along).
+    `osascript` banners do show. Used only for the auto-mic switch, which is
+    rare, so turning on every per-dictation notification is not a side effect.
+    Fire-and-forget: never blocks or raises."""
+    def q(s):
+        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    script = f"display notification {q(message)} with title {q('VoiceClip')} subtitle {q(subtitle)}"
+    try:
+        subprocess.Popen(["osascript", "-e", script],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        _log(f"banner failed: {e}")
 
 
 def _copy_to_clipboard(text: str):
