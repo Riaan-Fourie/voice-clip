@@ -25,7 +25,7 @@
 - Returns WAV bytes on `stop()` using the `wave` module
 
 ### transcriber.py — Speech-to-Text
-- **Parakeet TDT 0.6B v2** via `parakeet-mlx` on the Apple Silicon GPU (Jarvis #769; was mlx-whisper)
+- **Parakeet TDT 0.6B v2** via `parakeet-mlx` on the Apple Silicon GPU, quantised to 8 bits at load (Jarvis #769; was mlx-whisper)
 - WAV bytes decoded in memory and fed straight to `get_logmel` + `generate`; no temp file, no ffmpeg
 - Lazy model load on first transcription, warmed with 1 s of silence; `mx.clear_cache()` after every clip
 - Proper nouns restored after transcription by `names.py` (joins + `replacements.txt`), since Parakeet takes no prompt
