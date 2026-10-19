@@ -25,11 +25,11 @@
 - Returns WAV bytes on `stop()` using the `wave` module
 
 ### transcriber.py — Speech-to-Text
-- **mlx-whisper** running locally on Apple Silicon Metal GPU
-- Model: `mlx-community/whisper-base-mlx` (~150MB, good speed/accuracy balance)
-- Lazy model loading on first transcription (warm-up with a silence WAV)
+- **Parakeet TDT 0.6B v2** via `parakeet-mlx` on the Apple Silicon GPU (Jarvis #769; was mlx-whisper)
+- WAV bytes decoded in memory and fed straight to `get_logmel` + `generate`; no temp file, no ffmpeg
+- Lazy model load on first transcription, warmed with 1 s of silence; `mx.clear_cache()` after every clip
+- Proper nouns restored after transcription by `names.py` (joins + `replacements.txt`), since Parakeet takes no prompt
 - Failed recordings saved to `~/.voice-clip/failed/` with error metadata for retry
-- Thread-safe initialization via `threading.Lock`
 
 ### overlay.py — VU Meter Overlay
 - **NSPanel** (not NSWindow) with `NonactivatingPanel` style — floats above fullscreen apps

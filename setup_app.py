@@ -27,7 +27,7 @@ OPTIONS = {
         "rumps",
         "sounddevice",
         "numpy",
-        "mlx_whisper",
+        "parakeet_mlx",
         "mlx",
         "objc",
         "AppKit",
@@ -37,7 +37,7 @@ OPTIONS = {
     ],
     "packages": [
         "mlx",
-        "mlx_whisper",
+        "parakeet_mlx",
         "huggingface_hub",
         "tokenizers",
         "safetensors",
