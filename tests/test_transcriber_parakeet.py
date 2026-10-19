@@ -78,10 +78,12 @@ def test_model_memory_is_pinned_before_the_model_loads(monkeypatch):
     monkeypatch.setitem(__import__("sys").modules, "parakeet_mlx", fake)
     monkeypatch.setattr(transcriber.Transcriber, "_run", staticmethod(lambda model, audio: ""))
     monkeypatch.setattr(transcriber, "load_replacements", lambda: [])
+    monkeypatch.setattr(transcriber.nn, "quantize", lambda model, group_size, bits: calls.append(("quantize", bits)))
     tr = transcriber.Transcriber()
     tr._ensure_init()
     assert calls[0] == ("wire", transcriber.WIRED_LIMIT_BYTES)
     assert calls[1][0] == "load"
+    assert calls[2] == ("quantize", 8)  # before the warm-up and before any dictation
     assert tr._model_loaded
 
 

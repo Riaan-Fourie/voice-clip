@@ -8,6 +8,7 @@ import wave
 from datetime import datetime
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 
 from names import correct_names, load_replacements
@@ -26,14 +27,23 @@ PROPER_NOUNS_PATH = os.path.join(STATE_DIR, "proper_nouns.txt")
 MODEL = "mlx-community/parakeet-tdt-0.6b-v2"
 MIN_SAMPLES = 1600  # 0.1 s at 16 kHz; shorter clips cannot hold a word
 
-# The weights are ~1.2 GB of GPU memory (bf16). On this 16 GB Mac, which runs
+# Quantised to 8 bits at load (Riaan's call, 2026-10-19): the weights drop from
+# ~1.22 GB (bf16) to ~0.74 GB, and the settled footprint from ~1.49 to ~0.92 GB.
+# On 12 of his clips the text matched the full model on 8 and differed by a
+# word or two on the rest, with neither version right where they differed.
+# 4-bit (~0.49 GB) changed the wording on 10 of 12, so it was not taken.
+QUANT_BITS = 8
+QUANT_GROUP_SIZE = 64
+
+# The weights are ~0.74 GB of GPU memory at 8 bits. On this 16 GB Mac, which runs
 # deep in swap, macOS paged them out whenever dictation sat idle for a few
 # minutes, and the next dictation took up to 6 s to fault them back in
 # (witnessed on #769; whisper-small.en did the same, 4.3 s after 10 idle
 # minutes). MLX's wired limit keeps buffers resident: set before the model
 # loads, it pins the weights (measured: +1.06 GB wired against +0.4 GB
-# without). The headroom above 1.2 GB covers the warm-up's working buffers.
-WIRED_LIMIT_BYTES = 1_700_000_000
+# without, on the bf16 model; +765 MB on the 8-bit one). The headroom above
+# the weights covers the warm-up's working buffers.
+WIRED_LIMIT_BYTES = 1_000_000_000
 
 # The pin alone was not enough: after an hour's pause the first dictation
 # still took 5.7 s while the next ones took 0.4 s (2026-10-19, swap 15.8 of
@@ -161,6 +171,8 @@ class Transcriber:
                 from parakeet_mlx import from_pretrained
                 _log(f"Loading speech model: {MODEL}")
                 model = from_pretrained(MODEL)
+                nn.quantize(model, group_size=QUANT_GROUP_SIZE, bits=QUANT_BITS)
+                mx.clear_cache()  # release the bf16 weights the quantised ones replace
                 self._run(model, np.zeros(16000, dtype=np.float32))  # 1 s warm-up
                 self._model = model
                 _log("Speech model loaded successfully")
