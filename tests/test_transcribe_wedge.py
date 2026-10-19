@@ -121,7 +121,7 @@ def _dead_thread():
 
 class TestWedgedTranscriberRecovery:
     """Issue #187 / jarvis-system #6 — a transcription wedged inside the native
-    mlx_whisper/Metal call must trigger a process re-exec, not just a gate reset."""
+    MLX/Metal speech-model call must trigger a process re-exec, not just a gate reset."""
 
     def test_busy_when_not_transcribing(self):
         import main

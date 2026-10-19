@@ -69,7 +69,7 @@ _instance_lock_fd = None
 # hung. small.en on this Mac transcribes in well under a second; 30s is far beyond
 # any real run (incl. the first cold model load). Recovery depends on whether the
 # worker thread is still alive: a leaked gate just needs a reset (issue #170), but a
-# thread genuinely wedged inside the native mlx_whisper/Metal call needs a full
+# thread genuinely wedged inside the native MLX/Metal speech-model call needs a full
 # process re-exec — no in-process reset can unwedge the GPU (jarvis-system #6).
 TRANSCRIBE_STUCK_TIMEOUT = 30.0
 
@@ -168,6 +168,9 @@ class VoiceClipApp(rumps.App):
             self.recorder.auto_choice = auto_choice
         _log("init: creating transcriber")
         self.transcriber = Transcriber()
+        # Load the speech model now, off the main thread, so the first dictation
+        # after a start or re-exec does not wait ~4 s for it (#769).
+        threading.Thread(target=self.transcriber._ensure_init, daemon=True).start()
         _log("init: transcriber done")
         self._key_pressed = False
         # Recording state machine. mode: None (idle) | "hold" (classic hold Right-Cmd,
@@ -231,7 +234,7 @@ class VoiceClipApp(rumps.App):
         log.info("Hotkey listener started")
 
         # Background watchdog: re-exec the process if a transcription hangs inside the
-        # native mlx_whisper/Metal call (jarvis-system #6). The hotkey-press backstop
+        # native MLX/Metal speech-model call (jarvis-system #6). The hotkey-press backstop
         # only recovers on the *next* press; this recovers with no user interaction.
         self._transcribe_watchdog_thread = threading.Thread(
             target=self._transcribe_watchdog, daemon=True
@@ -326,7 +329,7 @@ class VoiceClipApp(rumps.App):
         stuck_for = time.monotonic() - self._transcribe_started_at
         if action == "reexec":
             # Thread still alive past the timeout = wedged in the native
-            # mlx_whisper/Metal call. No reset can unwedge it (jarvis-system #6).
+            # MLX/Metal speech-model call. No reset can unwedge it (jarvis-system #6).
             log.error(f"Transcription wedged {stuck_for:.0f}s (on press) — re-execing")
             _log(f"Transcription wedged {stuck_for:.0f}s (on press) — re-execing")
             self._reexec()  # never returns
@@ -613,7 +616,7 @@ class VoiceClipApp(rumps.App):
                        gone: a cheap flag reset is enough (the leaked-gate case the
                        #170 `finally` is meant to prevent, kept as belt-and-braces).
             "reexec" — gate held past the timeout AND the worker thread is still
-                       alive: it's wedged inside the native mlx_whisper/Metal call,
+                       alive: it's wedged inside the native MLX/Metal speech-model call,
                        which nothing in-process can unwedge (jarvis-system #6). The
                        process must be replaced.
         """
@@ -634,7 +637,7 @@ class VoiceClipApp(rumps.App):
         1. AUDIO (#333) — `recorder.start()`/`stop()` deadlocks inside the CoreAudio
            HAL. This one also holds `_rec_lock`, so it kills the entire hotkey path,
            not just one recording. Checked first; always fatal, always re-exec.
-        2. TRANSCRIPTION (jarvis-system #6) — a hang inside `mlx_whisper.transcribe`
+        2. TRANSCRIPTION (jarvis-system #6) — a hang inside the MLX speech model
            (native Metal) never returns, so the thread stays alive and no in-process
            reset can unwedge the GPU. Every later press logs PRESS/RELEASE with no
            Transcribing line until a manual restart.
@@ -700,10 +703,10 @@ class VoiceClipApp(rumps.App):
         """Replace this wedged process image with a fresh one — the automatic
         equivalent of the manual kill+restart that has always been the only fix.
 
-        A hang in mlx_whisper's native Metal call can't be unwedged in-process:
+        A hang in the speech model's native Metal call can't be unwedged in-process:
         Python can't kill the worker thread, clearing the gate just piles the next
-        recording behind the same stuck GPU queue, and a new Transcriber reuses
-        mlx_whisper's process-global model singleton. `os.execv` keeps the PID but
+        recording behind the same stuck GPU queue, and the GPU queue is
+        process-global. `os.execv` keeps the PID but
         discards ALL in-process state, so the fresh image re-loads the model and
         re-attaches the CGEventTap from clean. The instance-lock fd is O_CLOEXEC, so
         exec releases the flock and the new image re-acquires it. execv keeps the
