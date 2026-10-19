@@ -67,3 +67,34 @@ def test_model_that_failed_to_load_reports_an_error(t):
 
 def test_model_is_parakeet_v2():
     assert transcriber.MODEL == "mlx-community/parakeet-tdt-0.6b-v2"
+
+
+def test_model_memory_is_pinned_before_the_model_loads(monkeypatch):
+    calls = []
+    monkeypatch.setattr(transcriber.mx, "set_wired_limit", lambda n: calls.append(("wire", n)))
+    monkeypatch.setattr(transcriber.mx, "device_info", lambda: {"max_recommended_working_set_size": 12_000_000_000})
+    fake = mock.Mock()
+    fake.from_pretrained.side_effect = lambda m: calls.append(("load", m)) or object()
+    monkeypatch.setitem(__import__("sys").modules, "parakeet_mlx", fake)
+    monkeypatch.setattr(transcriber.Transcriber, "_run", staticmethod(lambda model, audio: ""))
+    monkeypatch.setattr(transcriber, "load_replacements", lambda: [])
+    tr = transcriber.Transcriber()
+    tr._ensure_init()
+    assert calls[0] == ("wire", transcriber.WIRED_LIMIT_BYTES)
+    assert calls[1][0] == "load"
+    assert tr._model_loaded
+
+
+def test_wired_limit_never_exceeds_half_the_system_cap(monkeypatch):
+    got = []
+    monkeypatch.setattr(transcriber.mx, "set_wired_limit", got.append)
+    monkeypatch.setattr(transcriber.mx, "device_info", lambda: {"max_recommended_working_set_size": 2_000_000_000})
+    transcriber._pin_model_memory()
+    assert got == [1_000_000_000]
+
+
+def test_wiring_failure_does_not_block_loading(monkeypatch):
+    def boom(n):
+        raise RuntimeError("not supported")
+    monkeypatch.setattr(transcriber.mx, "set_wired_limit", boom)
+    transcriber._pin_model_memory()  # must not raise

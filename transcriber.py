@@ -19,13 +19,20 @@ PROPER_NOUNS_PATH = os.path.join(STATE_DIR, "proper_nouns.txt")
 # app moved to Parakeet in 2025-2026, and on Riaan's own clips it held up far
 # better than whisper-small.en on the built-in mic in a noisy room, at about
 # 0.2 s a clip (research: docs/research/voiceclip-stt-engines-2026-10-19 in
-# Jarvis). v2 over the multilingual v3 for memory: ~820 MB peak against
-# ~1,250 MB in a fresh process, on a 16 GB Mac that already swaps (see the
-# 2026-06-15 note: a 1.4 GB Whisper got paged out between dictations).
-# Parakeet takes no prompt, so proper nouns are fixed after transcription
-# (names.py) instead of through Whisper's initial_prompt.
+# Jarvis). v2 is English-only; v3 adds 24 more languages for a slightly
+# larger model. Parakeet takes no prompt, so proper nouns are fixed after
+# transcription (names.py) instead of through Whisper's initial_prompt.
 MODEL = "mlx-community/parakeet-tdt-0.6b-v2"
 MIN_SAMPLES = 1600  # 0.1 s at 16 kHz; shorter clips cannot hold a word
+
+# The weights are ~1.2 GB of GPU memory (bf16). On this 16 GB Mac, which runs
+# deep in swap, macOS paged them out whenever dictation sat idle for a few
+# minutes, and the next dictation took up to 6 s to fault them back in
+# (witnessed on #769; whisper-small.en did the same, 4.3 s after 10 idle
+# minutes). MLX's wired limit keeps buffers resident: set before the model
+# loads, it pins the weights (measured: +1.06 GB wired against +0.4 GB
+# without). The headroom above 1.2 GB covers the warm-up's working buffers.
+WIRED_LIMIT_BYTES = 1_700_000_000
 
 DEFAULT_PROPER_NOUNS = """# VoiceClip proper nouns — restored after transcription (names.py).
 # One entry per line. Names with internal capitals, digits or accents
@@ -107,6 +114,18 @@ def _wav_bytes_to_float32(wav_bytes: bytes) -> np.ndarray:
         return np.ascontiguousarray(data, dtype=np.float32)
 
 
+def _pin_model_memory():
+    """Keep the model resident between dictations (see WIRED_LIMIT_BYTES).
+    Best-effort: without it dictation still works, only slower after idle."""
+    try:
+        cap = mx.device_info().get("max_recommended_working_set_size", 0)
+        limit = min(WIRED_LIMIT_BYTES, int(cap * 0.5)) if cap else WIRED_LIMIT_BYTES
+        mx.set_wired_limit(limit)
+        _log(f"Wired limit set to {limit / 1e9:.2f} GB")
+    except Exception as e:
+        _log(f"Could not set the wired limit: {e}")
+
+
 class Transcriber:
     def __init__(self):
         self._model = None
@@ -125,6 +144,7 @@ class Transcriber:
             if self._model is not None:
                 return
             try:
+                _pin_model_memory()
                 from parakeet_mlx import from_pretrained
                 _log(f"Loading speech model: {MODEL}")
                 model = from_pretrained(MODEL)
@@ -176,7 +196,7 @@ class Transcriber:
             if text:
                 fixed = correct_names(text, self._names, self._replacements)
                 if fixed != text:
-                    _log(f"Names corrected: {text[:80]} -> {fixed[:80]}")
+                    _log(f"Names corrected: {text[:300]!r} -> {fixed[:300]!r}")
                 text = fixed
             _log(f"Transcription result: {text[:80]}")
 
