@@ -66,7 +66,11 @@ def _trace_captured_audio(audio_data):
 MIC_AIRPODS = "airpods"
 MIC_MACBOOK = "macbook"
 MIC_SYSTEM = "system"
-MIC_PREFERENCES = (MIC_AIRPODS, MIC_MACBOOK, MIC_SYSTEM)
+# "auto" picks AirPods or the MacBook mic per dictation from a room check on the
+# MacBook mic (Jarvis #767, room_check.py). The Recorder only knows which of the
+# two it was told to use next (auto_choice) and hands back the probe audio.
+MIC_AUTO = "auto"
+MIC_PREFERENCES = (MIC_AUTO, MIC_AIRPODS, MIC_MACBOOK, MIC_SYSTEM)
 DEFAULT_MIC_PREFERENCE = MIC_AIRPODS
 
 
@@ -217,6 +221,13 @@ class Recorder:
         self.hooks = hooks
         self.last_device_name = None  # set on each start(); for status display
         self._nap_token = None  # App Nap assertion held while the stream is open (#277)
+        # Auto mic (#767): which mic "auto" uses for the next recording, and the
+        # MacBook-mic audio of the last one for the room check.
+        self.auto_choice = MIC_MACBOOK
+        self._probe_stream = None
+        self._probe_frames = []
+        self._probe_is_main = False
+        self._probe_audio = None
 
     def _hook(self, name, *args):
         fn = getattr(self.hooks, name, None) if self.hooks else None
@@ -241,8 +252,11 @@ class Recorder:
             # Keep the process out of App Nap for the whole recording, or the
             # Bluetooth mic goes silent after ~4s (#277).
             self._nap_token = _begin_no_nap()
+            self._probe_frames = []
+            self._probe_is_main = False
+            self._probe_audio = None
             try:
-                device, name = resolve_with_refresh(self.mic_preference)
+                device, name = resolve_with_refresh(self._wanted_mic())
             except Exception as e:
                 _log(f"mic resolve failed ({e}) — using system default", tag="recorder")
                 device, name = None, "System Default"
@@ -255,7 +269,10 @@ class Recorder:
                 except Exception:
                     pass
             self.last_device_name = name
-            _log(f"recording via {name} (pref={self.mic_preference})", tag="recorder")
+            pref = self.mic_preference
+            if pref == MIC_AUTO:
+                pref = f"{MIC_AUTO}:{self.auto_choice}"
+            _log(f"recording via {name} (pref={pref})", tag="recorder")
 
             # Duck volume / pause music BEFORE the stream opens — opening the
             # stream is what flips the Bluetooth link to HFP.
@@ -271,7 +288,7 @@ class Recorder:
                 _log(f"open {name} failed ({e}) — refreshing device table", tag="recorder")
                 _reinit_portaudio()
                 try:
-                    device, name = resolve_input_device(self.mic_preference)
+                    device, name = resolve_input_device(self._wanted_mic())
                     if device is None:
                         try:
                             name = sd.query_devices(kind="input")["name"]
@@ -298,6 +315,59 @@ class Recorder:
                         raise
             self._stream.start()
             self._hook("post_open")
+            if self.mic_preference == MIC_AUTO:
+                self._open_probe()
+
+    def _wanted_mic(self):
+        """The preference to resolve: auto stands in for its current choice."""
+        if self.mic_preference == MIC_AUTO:
+            return self.auto_choice
+        return self.mic_preference
+
+    def _open_probe(self):
+        """Capture the MacBook mic for the room check (#767).
+
+        When the recording already runs on the MacBook mic, that stream is the
+        probe. Otherwise open a second stream on it: the built-in mic has no
+        Bluetooth link to flip, so this is invisible. Best-effort: a probe
+        that fails to open only skips the room check."""
+        if "macbook" in (self.last_device_name or "").lower():
+            self._probe_is_main = True
+            return
+        try:
+            device, name = resolve_input_device(MIC_MACBOOK)
+            if device is None or "macbook" not in name.lower():
+                _log("room check: no MacBook mic to probe", tag="recorder")
+                return
+            self._probe_stream = sd.InputStream(
+                device=device,
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype=DTYPE,
+                blocksize=BLOCKSIZE,
+                callback=self._probe_callback,
+            )
+            self._probe_stream.start()
+        except Exception as e:
+            self._probe_stream = None
+            _log(f"room check: probe open failed ({e})", tag="recorder")
+
+    def _close_probe(self):
+        if self._probe_stream is None:
+            return
+        try:
+            self._probe_stream.stop()
+            self._probe_stream.close()
+        except Exception as e:
+            _log(f"room check: probe close failed ({e})", tag="recorder")
+        self._probe_stream = None
+
+    def take_probe_audio(self):
+        """MacBook-mic audio (int16 mono) of the last recording, or None.
+
+        Cleared on read, so a stale clip can never score a later dictation."""
+        audio, self._probe_audio = self._probe_audio, None
+        return audio
 
     def _open_stream(self, device):
         return sd.InputStream(
@@ -321,12 +391,19 @@ class Recorder:
             self._stream.stop()
             self._stream.close()
             self._stream = None
+            self._close_probe()
             self._hook("post_close")
             frames = self._frames
             self._frames = []
+            probe_frames = self._probe_frames
+            self._probe_frames = []
 
         # Convert frames to WAV bytes
         audio_data = np.concatenate(frames, axis=0) if frames else np.array([], dtype=DTYPE)
+        if self._probe_is_main:
+            self._probe_audio = audio_data[:, 0] if audio_data.ndim > 1 else audio_data
+        elif probe_frames:
+            self._probe_audio = np.concatenate(probe_frames, axis=0)[:, 0]
         if _DEBUG_AUDIO_ON:
             _trace_captured_audio(audio_data)
         buf = io.BytesIO()
@@ -336,6 +413,10 @@ class Recorder:
             wf.setframerate(SAMPLE_RATE)
             wf.writeframes(audio_data.tobytes())
         return buf.getvalue()
+
+    def _probe_callback(self, indata, frames, time_info, status):
+        if self._recording:
+            self._probe_frames.append(indata.copy())
 
     def _audio_callback(self, indata, frames, time_info, status):
         """Called by sounddevice for each audio block."""

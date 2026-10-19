@@ -26,9 +26,11 @@ from recorder import (
     MIC_AIRPODS,
     MIC_MACBOOK,
     MIC_SYSTEM,
+    MIC_AUTO,
     MIC_PREFERENCES,
     DEFAULT_MIC_PREFERENCE,
 )
+from room_check import voice_to_noise_db, next_choice
 from transcriber import Transcriber
 from overlay import RecordingOverlay
 from hotkey import HotkeyListener
@@ -45,6 +47,7 @@ from utils import _log, STATE_DIR, LOG_PATH, load_settings, save_settings
 
 # Menu labels for the Microphone submenu, in display order.
 MIC_MENU_LABELS = {
+    MIC_AUTO: "Auto (by room noise)",
     MIC_AIRPODS: "AirPods",
     MIC_MACBOOK: "MacBook Mic",
     MIC_SYSTEM: "System Default",
@@ -158,6 +161,11 @@ class VoiceClipApp(rumps.App):
             mic_preference=mic_pref,
             hooks=self.transition,
         )
+        # Auto mic (#767): remember the last room-check choice across restarts,
+        # so a restart in a noisy room does not cost one bad dictation.
+        auto_choice = settings.get("auto_mic_choice", MIC_MACBOOK)
+        if auto_choice in (MIC_AIRPODS, MIC_MACBOOK):
+            self.recorder.auto_choice = auto_choice
         _log("init: creating transcriber")
         self.transcriber = Transcriber()
         _log("init: transcriber done")
@@ -537,9 +545,41 @@ class VoiceClipApp(rumps.App):
             self.title = "\u2705"  # ✅
             self._notify("Copied to Clipboard", text[:100])
             threading.Timer(3.0, self._reset_status).start()
+            if any(c.isalnum() for c in text):
+                self._room_check()
         else:
             self._set_status("No speech detected")
             self.title = "\U0001f399"  # 🎙
+        self.recorder.take_probe_audio()  # a clip never outlives its dictation
+
+    def _room_check(self):
+        """Auto mic (#767): score the room on the MacBook mic and pick the mic
+        for the NEXT dictation. Runs only after a transcription found words
+        (Whisper renders a silent or drowned clip as "!"), so a silent hold
+        can never read as a noisy room. Never raises: the
+        dictation is already pasted, and a failed check just keeps the mic."""
+        try:
+            if self.recorder.mic_preference != MIC_AUTO:
+                return
+            audio = self.recorder.take_probe_audio()
+            score = voice_to_noise_db(audio) if audio is not None else None
+            old = self.recorder.auto_choice
+            new = next_choice(old, score)
+            shown = "n/a" if score is None else f"{score:.1f} dB"
+            log.info(f"Room check: Mac mic voice-to-noise {shown}, next dictation: {new}")
+            if new == old:
+                return
+            self.recorder.auto_choice = new
+            settings = load_settings()
+            settings["auto_mic_choice"] = new
+            save_settings(settings)
+            if new == MIC_AIRPODS:
+                _show_banner("Mic: AirPods", f"Noisy room ({shown}). The next dictation uses the AirPods.")
+            else:
+                _show_banner("Mic: MacBook", f"Quiet room ({shown}). The next dictation uses the MacBook mic.")
+        except Exception as e:
+            log.error(f"Room check failed: {e}", exc_info=True)
+            _log(f"Room check failed: {e}")
 
     def _safe_transcribe(self, wav_bytes: bytes):
         """Thread entry point that GUARANTEES `_transcribing` is cleared.
@@ -731,6 +771,25 @@ class VoiceClipApp(rumps.App):
             message=message,
             sound=False,
         )
+
+
+def _show_banner(subtitle: str, message: str):
+    """A notification banner that actually reaches the screen.
+
+    `rumps.notification` posts as org.python.python, which has no entry in
+    Notification Centre settings, so macOS delivers it with no visible banner
+    (witnessed on #767: "Copied to Clipboard" has been invisible all along).
+    `osascript` banners do show. Used only for the auto-mic switch, which is
+    rare, so turning on every per-dictation notification is not a side effect.
+    Fire-and-forget: never blocks or raises."""
+    def q(s):
+        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    script = f"display notification {q(message)} with title {q('VoiceClip')} subtitle {q(subtitle)}"
+    try:
+        subprocess.Popen(["osascript", "-e", script],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        _log(f"banner failed: {e}")
 
 
 def _copy_to_clipboard(text: str):
