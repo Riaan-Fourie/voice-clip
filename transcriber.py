@@ -3,6 +3,7 @@
 import io
 import os
 import threading
+import time
 import wave
 from datetime import datetime
 
@@ -33,6 +34,14 @@ MIN_SAMPLES = 1600  # 0.1 s at 16 kHz; shorter clips cannot hold a word
 # loads, it pins the weights (measured: +1.06 GB wired against +0.4 GB
 # without). The headroom above 1.2 GB covers the warm-up's working buffers.
 WIRED_LIMIT_BYTES = 1_700_000_000
+
+# The pin alone was not enough: after an hour's pause the first dictation
+# still took 5.7 s while the next ones took 0.4 s (2026-10-19, swap 15.8 of
+# 16.4 GB used). macOS also evicts the Python and MLX code around the model.
+# So while dictation is idle, run the model on half a second of silence once
+# a minute. Measured on #769: under a minute idle, a dictation took ~0.4 s;
+# after 3+ minutes, 1.4 to 5.9 s. The pass costs ~0.1 s of GPU a minute.
+KEEP_WARM_SECONDS = 60
 
 DEFAULT_PROPER_NOUNS = """# VoiceClip proper nouns — restored after transcription (names.py).
 # One entry per line. Names with internal capitals, digits or accents
@@ -130,6 +139,10 @@ class Transcriber:
     def __init__(self):
         self._model = None
         self._init_lock = threading.Lock()
+        self._run_lock = threading.Lock()  # one model pass at a time
+        self._last_used = time.monotonic()
+        self._warm_thread = None
+        self._warm_passes = 0
         self._names = _load_proper_nouns()
         self._replacements = load_replacements()
         _log(f"Loaded {len(self._names)} proper nouns, {len(self._replacements)} replacements")
@@ -151,6 +164,7 @@ class Transcriber:
                 self._run(model, np.zeros(16000, dtype=np.float32))  # 1 s warm-up
                 self._model = model
                 _log("Speech model loaded successfully")
+                self._start_keep_warm()
             except Exception as e:
                 _log(f"Failed to load speech model: {e}")
             finally:
@@ -162,6 +176,41 @@ class Transcriber:
         from parakeet_mlx.audio import get_logmel
         mel = get_logmel(mx.array(audio), model.preprocessor_config)
         return model.generate(mel)[0].text.strip()
+
+    def _start_keep_warm(self):
+        if self._warm_thread is None:
+            self._warm_thread = threading.Thread(target=self._keep_warm_loop, daemon=True)
+            self._warm_thread.start()
+
+    def _keep_warm_loop(self):
+        while True:
+            time.sleep(KEEP_WARM_SECONDS)
+            self._keep_warm_once()
+
+    def _keep_warm_once(self):
+        """Touch the model if dictation has been idle a full interval.
+
+        Never waits for a real transcription: if one holds the model, this
+        pass is skipped. Returns True when it ran."""
+        if self._model is None:
+            return False
+        if time.monotonic() - self._last_used < KEEP_WARM_SECONDS:
+            return False
+        if not self._run_lock.acquire(blocking=False):
+            return False
+        try:
+            self._run(self._model, np.zeros(8000, dtype=np.float32))
+            self._warm_passes += 1
+            if self._warm_passes == 1:  # one line, not one a minute
+                _log(f"keep-warm active: model touched every {KEEP_WARM_SECONDS}s while idle")
+            return True
+        except Exception as e:
+            _log(f"keep-warm pass failed: {e}")
+            return False
+        finally:
+            self._last_used = time.monotonic()
+            self._run_lock.release()
+            mx.clear_cache()
 
     def reload_proper_nouns(self):
         """Re-read the proper nouns and replacements files. Call after editing them."""
@@ -192,7 +241,11 @@ class Transcriber:
                 raise RuntimeError("speech model not loaded")
             audio = _wav_bytes_to_float32(wav_bytes)
             _log(f"Transcribing {len(audio) / 16000:.1f}s of audio")
-            text = self._run(self._model, audio) if len(audio) >= MIN_SAMPLES else ""
+            text = ""
+            if len(audio) >= MIN_SAMPLES:
+                with self._run_lock:
+                    text = self._run(self._model, audio)
+                    self._last_used = time.monotonic()
             if text:
                 fixed = correct_names(text, self._names, self._replacements)
                 if fixed != text:

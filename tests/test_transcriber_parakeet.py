@@ -98,3 +98,38 @@ def test_wiring_failure_does_not_block_loading(monkeypatch):
         raise RuntimeError("not supported")
     monkeypatch.setattr(transcriber.mx, "set_wired_limit", boom)
     transcriber._pin_model_memory()  # must not raise
+
+
+class TestKeepWarm:
+    def test_runs_after_a_full_idle_interval(self, t, monkeypatch):
+        t._last_used -= transcriber.KEEP_WARM_SECONDS + 1
+        assert t._keep_warm_once() is True
+        assert len(t.heard) == 1 and len(t.heard[0]) == 8000
+
+    def test_skips_when_dictation_was_recent(self, t):
+        t.transcribe(_wav(2))
+        t.heard.clear()
+        assert t._keep_warm_once() is False
+        assert t.heard == []
+
+    def test_never_waits_for_a_real_transcription(self, t):
+        t._last_used -= transcriber.KEEP_WARM_SECONDS + 1
+        with t._run_lock:  # a dictation is mid-transcription
+            assert t._keep_warm_once() is False
+        assert t.heard == []
+
+    def test_a_failed_pass_never_raises(self, t, monkeypatch):
+        t._last_used -= transcriber.KEEP_WARM_SECONDS + 1
+        def boom(model, audio):
+            raise RuntimeError("metal")
+        monkeypatch.setattr(transcriber.Transcriber, "_run", staticmethod(boom))
+        assert t._keep_warm_once() is False
+        assert not t._run_lock.locked()
+
+    def test_loading_the_model_starts_the_loop_once(self, monkeypatch):
+        started = []
+        monkeypatch.setattr(transcriber.threading, "Thread", lambda **kw: mock.Mock(start=lambda: started.append(kw["target"].__name__)))
+        monkeypatch.setattr(transcriber, "load_replacements", lambda: [])
+        tr = transcriber.Transcriber()
+        tr._start_keep_warm(); tr._start_keep_warm()
+        assert started == ["_keep_warm_loop"]
