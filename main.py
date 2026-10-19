@@ -168,6 +168,9 @@ class VoiceClipApp(rumps.App):
             self.recorder.auto_choice = auto_choice
         _log("init: creating transcriber")
         self.transcriber = Transcriber()
+        # Load the speech model now, off the main thread, so the first dictation
+        # after a start or re-exec does not wait ~4 s for it (#769).
+        threading.Thread(target=self.transcriber._ensure_init, daemon=True).start()
         _log("init: transcriber done")
         self._key_pressed = False
         # Recording state machine. mode: None (idle) | "hold" (classic hold Right-Cmd,
