@@ -54,6 +54,12 @@
 - NSPanel with `NonactivatingPanel` + `setFloatingPanel_(True)` + `setHidesOnDeactivate_(False)` works
 - `orderFrontRegardless()` ensures visibility regardless of app activation state
 
+### Auto Mic (Jarvis #767)
+- **Microphone → Auto** picks the mic for the *next* dictation from a room check on the MacBook mic (`room_check.py`)
+- Score = loudest 50 ms frames (95th pct) over quietest (20th pct), in dB; below 10 dB → AirPods, above 15 dB → MacBook mic, in between → no change
+- The MacBook mic is always the probe: it is the main stream on a MacBook recording and a second stream on an AirPods one; the AirPods are never opened just to measure (HFP flip, #269)
+- Runs only after a transcription found speech, so a silent hold cannot read as a noisy room
+
 ### Built-in Mic Preference
 - Bluetooth SCO/HFP codec is low quality (8kHz mono) — Whisper struggles with it
 - MacBook Air built-in mic at normal speaking distance produces good 16kHz audio
